@@ -56,14 +56,12 @@ class Ex:
         self._inner.connect()
         self._rl = RateLimiter(18)
         self._books: dict = {}
-        self._cancelled: set = set()
 
     def _r(self):
         self._rl.acquire()
 
     def clear_cache(self):
         self._books.clear()
-        self._cancelled.clear()
 
     def reconnect(self):
         self._inner = Exchange()
@@ -95,17 +93,8 @@ class Ex:
         return self._inner.insert_order(iid, price=price, volume=volume, side=side, order_type=otype)
 
     def cancel(self, iid: str):
-        if iid in self._cancelled:
-            return
         self._r()
         self._inner.delete_orders(iid)
-        self._cancelled.add(iid)
-
-    def safe_ioc(self, iid: str, price: float, volume: int, side: str):
-        self.cancel(iid)
-        if volume > 0:
-            self._r()
-            self._inner.insert_order(iid, price=price, volume=volume, side=side, order_type="ioc")
 
 
 class Pos:
@@ -187,11 +176,10 @@ def discover(e):
     return insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts
 
 
-def cancel_all_orders(e):
+def cancel_all(e):
     insts = e.get_instruments()
     for iid in insts:
         e.cancel(iid)
-    e._cancelled.clear()
     time.sleep(0.5)
 
 
@@ -213,7 +201,8 @@ def run_dual(e, duals, pos, insts):
             if v > 0:
                 e.insert(dual, dask, v, "bid", "ioc")
                 pos.fill(dual, v, "bid")
-                e.safe_ioc(liquid, lbid, v, "ask")
+                e.cancel(liquid)
+                e.insert(liquid, lbid, v, "ask", "ioc")
                 pos.fill(liquid, v, "ask")
 
         if dbid > lask:
@@ -221,7 +210,8 @@ def run_dual(e, duals, pos, insts):
             if v > 0:
                 e.insert(dual, dbid, v, "ask", "ioc")
                 pos.fill(dual, v, "ask")
-                e.safe_ioc(liquid, lask, v, "bid")
+                e.cancel(liquid)
+                e.insert(liquid, lask, v, "bid", "ioc")
                 pos.fill(liquid, v, "bid")
 
         dp = pos.get(dual)
@@ -246,12 +236,14 @@ def run_dual(e, duals, pos, insts):
                 if net > 0:
                     hv = min(abs(net), pos.hr(liquid, "ask"))
                     if hv > 0:
-                        e.safe_ioc(liquid, lb2.bids[0].price, hv, "ask")
+                        e.cancel(liquid)
+                        e.insert(liquid, lb2.bids[0].price, hv, "ask", "ioc")
                         pos.fill(liquid, hv, "ask")
                 else:
                     hv = min(abs(net), pos.hr(liquid, "bid"))
                     if hv > 0:
-                        e.safe_ioc(liquid, lb2.asks[0].price, hv, "bid")
+                        e.cancel(liquid)
+                        e.insert(liquid, lb2.asks[0].price, hv, "bid", "ioc")
                         pos.fill(liquid, hv, "bid")
 
 
@@ -297,17 +289,6 @@ def run_etf(e, primary_fut, insts, pos, const_idx):
     if av > 0:
         e.insert("OB5X_ETF", ap, av, "ask", "limit")
 
-    fp = pos.get(primary_fut)
-    target = -round(ETF_M * ep)
-    hedge = target - fp
-    if hedge != 0:
-        side = "bid" if hedge > 0 else "ask"
-        price = fask if hedge > 0 else fbid
-        hv = min(abs(hedge), pos.hr(primary_fut, side), POSITION_LIMIT)
-        if hv > 0:
-            e.safe_ioc(primary_fut, price, hv, side)
-            pos.fill(primary_fut, hv, side)
-
 
 def quote_option(e, oid, opt, underlying_mid, pos, insts):
     T = calculate_current_time_to_date(opt.expiry)
@@ -352,16 +333,20 @@ def run_futures_arb(e, ob5x_futs, stock_futs, insts, pos):
             if spread > CALENDAR_THRESHOLD:
                 v = min(5, pos.hr(far, "ask"), pos.hr(near, "bid"))
                 if v > 0:
-                    e.safe_ioc(far, fb.bids[0].price, v, "ask")
+                    e.cancel(far)
+                    e.insert(far, fb.bids[0].price, v, "ask", "ioc")
                     pos.fill(far, v, "ask")
-                    e.safe_ioc(near, nb.asks[0].price, v, "bid")
+                    e.cancel(near)
+                    e.insert(near, nb.asks[0].price, v, "bid", "ioc")
                     pos.fill(near, v, "bid")
             elif spread < -CALENDAR_THRESHOLD:
                 v = min(5, pos.hr(far, "bid"), pos.hr(near, "ask"))
                 if v > 0:
-                    e.safe_ioc(far, fb.asks[0].price, v, "bid")
+                    e.cancel(far)
+                    e.insert(far, fb.asks[0].price, v, "bid", "ioc")
                     pos.fill(far, v, "bid")
-                    e.safe_ioc(near, nb.bids[0].price, v, "ask")
+                    e.cancel(near)
+                    e.insert(near, nb.bids[0].price, v, "ask", "ioc")
                     pos.fill(near, v, "ask")
 
     for stock, futs in stock_futs.items():
@@ -384,16 +369,20 @@ def run_futures_arb(e, ob5x_futs, stock_futs, insts, pos):
             if basis > BASIS_THRESHOLD:
                 v = min(5, pos.hr(fid, "ask"), pos.hr(stock, "bid"))
                 if v > 0:
-                    e.safe_ioc(fid, fbook.bids[0].price, v, "ask")
+                    e.cancel(fid)
+                    e.insert(fid, fbook.bids[0].price, v, "ask", "ioc")
                     pos.fill(fid, v, "ask")
-                    e.safe_ioc(stock, sb.asks[0].price, v, "bid")
+                    e.cancel(stock)
+                    e.insert(stock, sb.asks[0].price, v, "bid", "ioc")
                     pos.fill(stock, v, "bid")
             elif basis < -BASIS_THRESHOLD:
                 v = min(5, pos.hr(fid, "bid"), pos.hr(stock, "ask"))
                 if v > 0:
-                    e.safe_ioc(fid, fbook.asks[0].price, v, "bid")
+                    e.cancel(fid)
+                    e.insert(fid, fbook.asks[0].price, v, "bid", "ioc")
                     pos.fill(fid, v, "bid")
-                    e.safe_ioc(stock, sb.bids[0].price, v, "ask")
+                    e.cancel(stock)
+                    e.insert(stock, sb.bids[0].price, v, "ask", "ioc")
                     pos.fill(stock, v, "ask")
 
 
@@ -419,12 +408,14 @@ def hedge_delta(e, pos, insts, stock_opts, idx_opts, ob5x_futs, stock_futs):
             if delta > 0.5:
                 lots = min(round(delta), pos.hr("ASML", "ask"), POSITION_LIMIT)
                 if lots > 0:
-                    e.safe_ioc("ASML", asml_book.bids[0].price, lots, "ask")
+                    e.cancel("ASML")
+                    e.insert("ASML", asml_book.bids[0].price, lots, "ask", "ioc")
                     pos.fill("ASML", lots, "ask")
             else:
                 lots = min(round(abs(delta)), pos.hr("ASML", "bid"), POSITION_LIMIT)
                 if lots > 0:
-                    e.safe_ioc("ASML", asml_book.asks[0].price, lots, "bid")
+                    e.cancel("ASML")
+                    e.insert("ASML", asml_book.asks[0].price, lots, "bid", "ioc")
                     pos.fill("ASML", lots, "bid")
 
     if ob5x_futs:
@@ -452,13 +443,35 @@ def hedge_delta(e, pos, insts, stock_opts, idx_opts, ob5x_futs, stock_futs):
                     if delta > 0.5:
                         lots = min(round(delta), pos.hr(pf, "ask"), POSITION_LIMIT)
                         if lots > 0:
-                            e.safe_ioc(pf, pfb.bids[0].price, lots, "ask")
+                            e.cancel(pf)
+                            e.insert(pf, pfb.bids[0].price, lots, "ask", "ioc")
                             pos.fill(pf, lots, "ask")
                     else:
                         lots = min(round(abs(delta)), pos.hr(pf, "bid"), POSITION_LIMIT)
                         if lots > 0:
-                            e.safe_ioc(pf, pfb.asks[0].price, lots, "bid")
+                            e.cancel(pf)
+                            e.insert(pf, pfb.asks[0].price, lots, "bid", "ioc")
                             pos.fill(pf, lots, "bid")
+
+
+def hedge_etf(e, primary_fut, pos):
+    if not primary_fut:
+        return
+    fb = e.book(primary_fut)
+    if not bok(fb):
+        return
+    ep = pos.get("OB5X_ETF")
+    fp = pos.get(primary_fut)
+    target = -round(ETF_M * ep)
+    hedge = target - fp
+    if hedge != 0:
+        side = "bid" if hedge > 0 else "ask"
+        price = fb.asks[0].price if hedge > 0 else fb.bids[0].price
+        hv = min(abs(hedge), pos.hr(primary_fut, side), POSITION_LIMIT)
+        if hv > 0:
+            e.cancel(primary_fut)
+            e.insert(primary_fut, price, hv, side, "ioc")
+            pos.fill(primary_fut, hv, side)
 
 
 def compute_index(e) -> float | None:
@@ -486,7 +499,7 @@ const_idx: float | None = None
 opt_cursor = 0
 iteration = 0
 
-cancel_all_orders(e)
+cancel_all(e)
 
 log.info(f"primary_fut={primary_fut}, {len(all_options)} options, {len(duals)} dual pairs")
 
@@ -504,7 +517,7 @@ while True:
                 all_options.append((oid, inst, "OB5X"))
             primary_fut = ob5x_futs[0] if ob5x_futs else None
             opt_cursor = 0
-            cancel_all_orders(e)
+            cancel_all(e)
             time.sleep(3)
             continue
 
@@ -550,6 +563,7 @@ while True:
             run_futures_arb(e, ob5x_futs, stock_futs, insts, pos)
 
         hedge_delta(e, pos, insts, stock_opts, idx_opts, ob5x_futs, stock_futs)
+        hedge_etf(e, primary_fut, pos)
 
         if iteration % 10 == 0:
             pnl = e.get_pnl()
