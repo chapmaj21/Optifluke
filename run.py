@@ -17,8 +17,6 @@ logging.getLogger("client").setLevel("ERROR")
 log = logging.getLogger("run")
 
 
-# ---- Rate limiter: wraps Exchange to enforce max 18 calls/sec ----
-
 class ThrottledExchange:
     def __init__(self, inner: Exchange, max_per_sec: int = 18):
         self._e = inner
@@ -67,8 +65,6 @@ class ThrottledExchange:
         return self._e.poll_new_trades(instrument_id)
 
 
-# ---- Constants ----
-
 POSITION_LIMIT = 100
 RATE = 0.03
 SIGMA = 3.0
@@ -83,7 +79,7 @@ DUAL_CREDIT = 0.02
 DUAL_VOLUME = 40
 ETF_CREDIT = 0.01
 ETF_VOLUME = 40
-OPTION_VOLUME = 40
+OPTION_VOLUME = 15
 
 MIN_CREDIT = 0.05
 VEGA_SCALE = 0.02
@@ -91,8 +87,6 @@ SPREAD_SCALE = 0.1
 MIN_CREDIT_FLOOR = 0.10
 MIN_CREDIT_PCT = 0.04
 
-
-# ---- Helpers ----
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
@@ -102,7 +96,7 @@ def book_ok(book) -> bool:
     return book and book.bids and book.asks
 
 
-def get_mid(e: Exchange, iid: str) -> float | None:
+def get_mid(e, iid: str) -> float | None:
     b = e.get_last_price_book(iid)
     if not book_ok(b):
         return None
@@ -123,7 +117,7 @@ def round_up(price: float, tick: float) -> float:
     return ceil(price / tick) * tick
 
 
-def compute_index(e: Exchange) -> float | None:
+def compute_index(e) -> float | None:
     total = 0.0
     for sid, w in CONSTITUENTS.items():
         mid = get_mid(e, sid)
@@ -157,9 +151,33 @@ def option_credit(theo: float, vega: float, spread: float) -> float:
     return max(MIN_CREDIT_FLOOR, c)
 
 
-# ---- Strategy: Dual Listing ----
+def clear_all_positions(e):
+    log.info("clearing all orders and flattening positions...")
+    instruments = e.get_instruments()
+    for iid in instruments:
+        e.delete_orders(iid)
 
-def run_dual_listing(e: Exchange, pairs: list, positions: dict):
+    time.sleep(1)
+    positions = e.get_positions()
+    for iid, pos in positions.items():
+        if pos == 0:
+            continue
+        book = e.get_last_price_book(iid)
+        if not book_ok(book):
+            continue
+        if pos > 0:
+            e.insert_order(iid, price=book.bids[0].price, volume=abs(pos), side="ask", order_type="ioc")
+        else:
+            e.insert_order(iid, price=book.asks[0].price, volume=abs(pos), side="bid", order_type="ioc")
+
+    time.sleep(1)
+    positions = e.get_positions()
+    remaining = {k: v for k, v in positions.items() if v != 0}
+    pnl = e.get_pnl()
+    log.info(f"after clearing: PnL={pnl:.2f}  remaining={remaining or 'flat'}")
+
+
+def run_dual_listing(e, pairs: list, positions: dict):
     for liquid, dual in pairs:
         liq_book = e.get_last_price_book(liquid)
         dual_book = e.get_last_price_book(dual)
@@ -171,7 +189,6 @@ def run_dual_listing(e: Exchange, pairs: list, positions: dict):
         dual_bid = dual_book.bids[0].price
         dual_ask = dual_book.asks[0].price
 
-        # Active arb
         if dual_ask < liq_bid:
             v = min(dual_book.asks[0].volume, 40)
             v = min(v, vol_headroom(positions.get(dual, 0), "bid"),
@@ -188,7 +205,6 @@ def run_dual_listing(e: Exchange, pairs: list, positions: dict):
                 e.insert_order(dual, price=dual_bid, volume=v, side="ask", order_type="ioc")
                 e.insert_order(liquid, price=liq_ask, volume=v, side="bid", order_type="ioc")
 
-        # Passive quoting on dual
         e.delete_orders(dual)
         dual_pos = positions.get(dual, 0)
         bid_vol = clamp(DUAL_VOLUME - dual_pos, 0, DUAL_VOLUME)
@@ -204,7 +220,6 @@ def run_dual_listing(e: Exchange, pairs: list, positions: dict):
         if ask_vol > 0:
             e.insert_order(dual, price=our_ask, volume=ask_vol, side="ask", order_type="limit")
 
-        # Hedge pair imbalance
         net = positions.get(dual, 0) + positions.get(liquid, 0)
         if net != 0:
             liq_book = e.get_last_price_book(liquid)
@@ -219,9 +234,7 @@ def run_dual_listing(e: Exchange, pairs: list, positions: dict):
                         e.insert_order(liquid, price=liq_book.asks[0].price, volume=hv, side="bid", order_type="ioc")
 
 
-# ---- Strategy: ETF-Future ----
-
-def run_etf_future(e: Exchange, primary_future: str, instruments: dict, positions: dict,
+def run_etf_future(e, primary_future: str, instruments: dict, positions: dict,
                    constituent_index: float | None):
     fut_book = e.get_last_price_book(primary_future)
     if not book_ok(fut_book):
@@ -263,7 +276,6 @@ def run_etf_future(e: Exchange, primary_future: str, instruments: dict, position
     if ask_vol > 0:
         e.insert_order("OB5X_ETF", price=ask_price, volume=ask_vol, side="ask", order_type="limit")
 
-    # Hedge: M * etf_pos + fut_pos = 0
     fut_pos = positions.get(primary_future, 0)
     target_fut = -round(ETF_M * etf_pos)
     hedge = target_fut - fut_pos
@@ -275,11 +287,7 @@ def run_etf_future(e: Exchange, primary_future: str, instruments: dict, position
             e.insert_order(primary_future, price=price, volume=hv, side=side, order_type="ioc")
 
 
-# ---- Strategy: Options Market Making ----
-
-def run_options_mm(e: Exchange, stock_options: dict, index_options: dict,
-                   S: float, index_value: float | None, positions: dict):
-    # Quote ASML stock options
+def run_options_mm(e, stock_options: dict, S: float, positions: dict):
     for oid, opt in stock_options.items():
         T = calculate_current_time_to_date(opt.expiry)
         if T <= 0:
@@ -304,35 +312,8 @@ def run_options_mm(e: Exchange, stock_options: dict, index_options: dict,
         if av > 0 and ap > 0:
             e.insert_order(oid, price=ap, volume=av, side="ask", order_type="limit")
 
-    # Quote OB5X index options
-    if index_value is not None:
-        for oid, opt in index_options.items():
-            T = calculate_current_time_to_date(opt.expiry)
-            if T <= 0:
-                continue
-            theo = bs_value(index_value, opt.strike, T, RATE, SIGMA, opt.option_kind)
-            vega = bs_vega(index_value, opt.strike, T, RATE, SIGMA, opt.option_kind)
 
-            opt_book = e.get_last_price_book(oid)
-            spread = (opt_book.asks[0].price - opt_book.bids[0].price) if book_ok(opt_book) else 0.0
-
-            credit = option_credit(theo, vega, spread)
-            pos = positions.get(oid, 0)
-
-            e.delete_orders(oid)
-            bp = round_down(theo - credit, TICK)
-            ap = round_up(theo + credit, TICK)
-            bv = min(OPTION_VOLUME, vol_headroom(pos, "bid"))
-            av = min(OPTION_VOLUME, vol_headroom(pos, "ask"))
-
-            if bv > 0 and bp > 0:
-                e.insert_order(oid, price=bp, volume=bv, side="bid", order_type="limit")
-            if av > 0 and ap > 0:
-                e.insert_order(oid, price=ap, volume=av, side="ask", order_type="limit")
-            time.sleep(0.10)
-
-
-def hedge_stock_options(e: Exchange, stock_options: dict, S: float, positions: dict):
+def hedge_stock_options(e, stock_options: dict, S: float, positions: dict):
     stock_pos = positions.get("ASML", 0)
     total_delta = float(stock_pos)
 
@@ -362,42 +343,8 @@ def hedge_stock_options(e: Exchange, stock_options: dict, S: float, positions: d
             e.insert_order("ASML", price=book.asks[0].price, volume=lots, side="bid", order_type="ioc")
 
 
-def hedge_index_options(e: Exchange, index_options: dict, index_value: float,
-                        positions: dict, future_id: str):
-    fut_pos = positions.get(future_id, 0)
-    total_delta = float(fut_pos)
-
-    for oid, opt in index_options.items():
-        pos = positions.get(oid, 0)
-        if pos == 0:
-            continue
-        T = calculate_current_time_to_date(opt.expiry)
-        if T <= 0:
-            continue
-        total_delta += pos * bs_delta(index_value, opt.strike, T, RATE, SIGMA, opt.option_kind)
-
-    if abs(total_delta) <= 0.5:
-        return
-
-    book = e.get_last_price_book(future_id)
-    if not book_ok(book):
-        return
-
-    if total_delta > 0.5:
-        lots = min(round(total_delta), vol_headroom(fut_pos, "ask"))
-        if lots > 0:
-            e.insert_order(future_id, price=book.bids[0].price, volume=lots, side="ask", order_type="ioc")
-    elif total_delta < -0.5:
-        lots = min(round(abs(total_delta)), vol_headroom(fut_pos, "bid"))
-        if lots > 0:
-            e.insert_order(future_id, price=book.asks[0].price, volume=lots, side="bid", order_type="ioc")
-
-
-# ---- Strategy: Cross-Instrument Arb (runs less frequently) ----
-
-def run_cross_arb(e: Exchange, instruments: dict, option_pairs: dict,
+def run_cross_arb(e, instruments: dict, option_pairs: dict,
                   asml_futures: list, positions: dict):
-    # Put-call parity on ASML stock options
     for (underlying, expiry, strike), kinds in option_pairs.items():
         if OptionKind.CALL not in kinds or OptionKind.PUT not in kinds:
             continue
@@ -436,7 +383,6 @@ def run_cross_arb(e: Exchange, instruments: dict, option_pairs: dict,
                     e.insert_order(call_id, price=cb.asks[0].price, volume=v, side="bid", order_type="ioc")
                     e.insert_order(put_id, price=pb.bids[0].price, volume=v, side="ask", order_type="ioc")
 
-    # Stock-future basis (ASML only)
     sb = e.get_last_price_book("ASML")
     if book_ok(sb):
         s_mid = (sb.bids[0].price + sb.asks[0].price) / 2.0
@@ -467,8 +413,6 @@ def run_cross_arb(e: Exchange, instruments: dict, option_pairs: dict,
                         e.insert_order("ASML", price=sb.bids[0].price, volume=v, side="ask", order_type="ioc")
 
 
-# ---- Main ----
-
 _raw = Exchange()
 _raw.connect()
 e = ThrottledExchange(_raw, max_per_sec=18)
@@ -476,7 +420,6 @@ e = ThrottledExchange(_raw, max_per_sec=18)
 instruments = e.get_instruments()
 log.info(f"connected, {len(instruments)} instruments")
 
-# Discover
 dual_pairs = [(iid, iid + "_DUAL") for iid in sorted(instruments) if iid + "_DUAL" in instruments]
 log.info(f"dual pairs: {dual_pairs}")
 
@@ -496,20 +439,16 @@ stock_options = {
     iid: inst for iid, inst in instruments.items()
     if inst.instrument_type == InstrumentType.STOCK_OPTION and inst.base_instrument_id == "ASML"
 }
-index_options = {
-    iid: inst for iid, inst in instruments.items()
-    if inst.instrument_type == InstrumentType.INDEX_OPTION
-}
 log.info(f"stock options: {list(stock_options.keys())}")
-log.info(f"index options: {list(index_options.keys())}")
 
-# Build put-call pairs for cross arb
 opt_pairs = {}
 for iid, inst in stock_options.items():
     key = (inst.base_instrument_id, inst.expiry, inst.strike)
     if key not in opt_pairs:
         opt_pairs[key] = {}
     opt_pairs[key][inst.option_kind] = iid
+
+clear_all_positions(e)
 
 constituent_index: float | None = None
 iteration = 0
@@ -528,41 +467,30 @@ while True:
         positions = e.get_positions()
         iteration += 1
 
-        # Compute ASML mid (used by options + dual listing)
         asml_mid = get_mid(e, "ASML")
 
-        # Compute constituent index every 3rd iteration (5 API calls)
         if iteration % 3 == 1:
             constituent_index = compute_index(e)
 
-        # ---- Phase 1: Dual listing (fast, ~10 API calls per pair) ----
         run_dual_listing(e, dual_pairs, positions)
         time.sleep(0.5)
 
-        # ---- Phase 2: ETF-Future quoting (~8 API calls) ----
         if primary_future:
             run_etf_future(e, primary_future, instruments, positions, constituent_index)
         time.sleep(0.5)
 
-        # ---- Phase 3: Options MM (~4 calls per option, 12 options = ~48 calls over ~1.2s) ----
         if asml_mid is not None:
-            run_options_mm(e, stock_options, index_options, asml_mid, constituent_index, positions)
+            run_options_mm(e, stock_options, asml_mid, positions)
 
-        # Re-read positions after options quoting (fills may have happened)
         positions = e.get_positions()
 
-        # ---- Phase 4: Delta hedge ----
         if asml_mid is not None:
             hedge_stock_options(e, stock_options, asml_mid, positions)
-        if constituent_index is not None and primary_future:
-            hedge_index_options(e, index_options, constituent_index, positions, primary_future)
         time.sleep(0.5)
 
-        # ---- Phase 5: Cross-instrument arb (every 5th iteration) ----
         if iteration % 5 == 0:
             run_cross_arb(e, instruments, opt_pairs, asml_futures, positions)
 
-        # Status
         if iteration % 10 == 0:
             pnl = e.get_pnl()
             active = {k: v for k, v in positions.items() if v != 0}
