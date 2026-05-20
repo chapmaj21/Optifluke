@@ -1,4 +1,3 @@
-import datetime as dt
 import time
 import logging
 from math import exp, floor, ceil
@@ -14,8 +13,6 @@ logging.getLogger("client").setLevel("ERROR")
 logger = logging.getLogger("algo")
 logger.setLevel("INFO")
 
-# --- Constants ---
-
 ETF_ID = "OB5X_ETF"
 CONSTITUENTS = {"ASML": 908.06, "AAPL": 129.24, "SAP": 124.78, "TSLA": 2245.39, "NVDA": 953.21}
 INDEX_DIVISOR = 1000.0
@@ -24,15 +21,13 @@ ETF_M = 0.25
 ETF_C = 2.50
 RISK_FREE_RATE = 0.03
 
-ETF_TICK = 0.01
+ETF_TICK = 0.10
 POSITION_LIMIT = 100
 MAX_QUOTE_VOLUME = 40
 CREDIT = 0.01
 
-SLEEP_S = 0.15
+SLEEP_S = 4.0
 
-
-# --- Pricing ---
 
 def index_from_constituents(exchange) -> float | None:
     total = 0.0
@@ -61,8 +56,6 @@ def round_up_tick(price: float, tick: float) -> float:
     return ceil(price / tick) * tick
 
 
-# --- Position helpers ---
-
 def clamp_volume(instrument_id: str, side: str, desired: int, positions: dict) -> int:
     pos = positions.get(instrument_id, 0)
     if side == "bid":
@@ -72,29 +65,42 @@ def clamp_volume(instrument_id: str, side: str, desired: int, positions: dict) -
     return max(0, min(desired, headroom))
 
 
-# --- Main ---
+def discover_futures(exchange) -> list[str]:
+    instruments = exchange.get_instruments()
+    fids = sorted(
+        [iid for iid, inst in instruments.items() if "OB5X" in iid and iid.endswith("_F")],
+        key=lambda iid: instruments[iid].expiry,
+    )
+    if not fids:
+        raise RuntimeError("No OB5X futures found")
+    return fids
+
 
 exchange = Exchange()
 exchange.connect()
 
-# Discover futures dynamically
 instruments = exchange.get_instruments()
-future_ids = sorted(
-    [iid for iid, inst in instruments.items() if "OB5X" in iid and iid.endswith("_F")],
-    key=lambda iid: instruments[iid].expiry
-)
-if not future_ids:
-    raise RuntimeError("No OB5X futures found")
-
+future_ids = discover_futures(exchange)
 PRIMARY_FUTURE = future_ids[0]
 logger.info(f"Primary future: {PRIMARY_FUTURE}, all futures: {future_ids}")
 
+constituent_index: float | None = None
 iteration = 0
 
 while True:
     iteration += 1
 
     try:
+        if not exchange.is_connected():
+            logger.warning("Disconnected, reconnecting...")
+            exchange = Exchange()
+            exchange.connect()
+            instruments = exchange.get_instruments()
+            future_ids = discover_futures(exchange)
+            PRIMARY_FUTURE = future_ids[0]
+            time.sleep(3.0)
+            continue
+
         positions = exchange.get_positions()
         pnl = exchange.get_pnl()
 
@@ -102,9 +108,7 @@ while True:
             pos_str = ", ".join(f"{k}={v}" for k, v in positions.items() if v != 0)
             logger.info(f"[iter {iteration}] PnL={pnl:.2f}  positions: {pos_str or 'flat'}")
 
-        # ------------------------------------------------------------------
-        # 1. Pull future book for primary future
-        # ------------------------------------------------------------------
+        # Pull future book for primary future (1 API call)
         future_book = exchange.get_last_price_book(PRIMARY_FUTURE)
         if not future_book or not future_book.bids or not future_book.asks:
             time.sleep(SLEEP_S)
@@ -118,28 +122,23 @@ while True:
         fut_ask = future_book.asks[0].price
         fut_mid = (fut_bid + fut_ask) / 2.0
 
-        # ------------------------------------------------------------------
-        # 2. Constituent-based index for cross-validation
-        # ------------------------------------------------------------------
-        constituent_index = index_from_constituents(exchange)
+        # Constituent index: 5 API calls, only every 5th iteration
+        if iteration % 5 == 1:
+            constituent_index = index_from_constituents(exchange)
+
         future_implied_index = future_price_to_index(fut_mid, tau)
 
-        # If constituent data available, blend with future-implied for a tighter fair value
         if constituent_index is not None:
             index_mid = (constituent_index + future_implied_index) / 2.0
         else:
             index_mid = future_implied_index
 
-        # ------------------------------------------------------------------
-        # 3. Compute ETF fair bid/ask from future bid/ask (conservative side)
-        # ------------------------------------------------------------------
+        # ETF fair value from future bid/ask
         etf_fair_bid = index_to_etf(future_price_to_index(fut_bid, tau))
         etf_fair_ask = index_to_etf(future_price_to_index(fut_ask, tau))
 
-        # If constituent index available and tighter, use it to improve quotes
         if constituent_index is not None:
             etf_from_constituent = index_to_etf(constituent_index)
-            # Widen fair if constituent disagrees (take conservative envelope)
             etf_fair_bid = min(etf_fair_bid, etf_from_constituent)
             etf_fair_ask = max(etf_fair_ask, etf_from_constituent)
 
@@ -150,22 +149,17 @@ while True:
             time.sleep(SLEEP_S)
             continue
 
-        # ------------------------------------------------------------------
-        # 4. Position-aware quoting volumes
-        # ------------------------------------------------------------------
+        # Position-aware quoting volumes
         etf_pos = positions.get(ETF_ID, 0)
         bid_vol = clamp_volume(ETF_ID, "bid", MAX_QUOTE_VOLUME, positions)
         ask_vol = clamp_volume(ETF_ID, "ask", MAX_QUOTE_VOLUME, positions)
 
-        # Skew: reduce volume on the side that increases risk
         if etf_pos > 10:
             bid_vol = max(1, bid_vol - etf_pos // 2)
         elif etf_pos < -10:
             ask_vol = max(1, ask_vol + etf_pos // 2)
 
-        # ------------------------------------------------------------------
-        # 5. Clear and re-quote ETF
-        # ------------------------------------------------------------------
+        # Clear and re-quote ETF (3 API calls: delete + 2 inserts)
         exchange.delete_orders(ETF_ID)
 
         if bid_vol > 0:
@@ -173,9 +167,7 @@ while True:
         if ask_vol > 0:
             exchange.insert_order(ETF_ID, price=etf_ask_price, volume=ask_vol, side="ask", order_type="limit")
 
-        # ------------------------------------------------------------------
-        # 6. Delta hedge: M * etf_pos + future_pos = 0
-        # ------------------------------------------------------------------
+        # Delta hedge (1-2 API calls)
         positions = exchange.get_positions()
         etf_pos = positions.get(ETF_ID, 0)
         fut_pos = positions.get(PRIMARY_FUTURE, 0)
@@ -201,10 +193,8 @@ while True:
                     order_type="ioc",
                 )
 
-        # ------------------------------------------------------------------
-        # 7. Cross-future arb: if two futures diverge beyond cost of carry
-        # ------------------------------------------------------------------
-        if len(future_ids) >= 2:
+        # Cross-future arb: expensive, only every 10th iteration
+        if iteration % 10 == 0 and len(future_ids) >= 2:
             for i in range(len(future_ids)):
                 for j in range(i + 1, len(future_ids)):
                     fid_near = future_ids[i]
@@ -223,11 +213,9 @@ while True:
                     near_mid = (book_near.bids[0].price + book_near.asks[0].price) / 2.0
                     far_mid = (book_far.bids[0].price + book_far.asks[0].price) / 2.0
 
-                    # Theoretical spread: far should be near * exp(r * (tau_far - tau_near))
                     fair_ratio = exp(RISK_FREE_RATE * (tau_far - tau_near))
                     fair_far = near_mid * fair_ratio
 
-                    # Far is rich relative to near: sell far, buy near
                     if far_mid > fair_far + 0.05:
                         arb_vol = 5
                         buy_vol = clamp_volume(fid_near, "bid", arb_vol, positions)
@@ -237,7 +225,6 @@ while True:
                             exchange.insert_order(fid_near, price=book_near.asks[0].price, volume=vol, side="bid", order_type="ioc")
                             exchange.insert_order(fid_far, price=book_far.bids[0].price, volume=vol, side="ask", order_type="ioc")
 
-                    # Far is cheap relative to near: buy far, sell near
                     elif far_mid < fair_far - 0.05:
                         arb_vol = 5
                         sell_vol = clamp_volume(fid_near, "ask", arb_vol, positions)
@@ -247,14 +234,11 @@ while True:
                             exchange.insert_order(fid_near, price=book_near.bids[0].price, volume=vol, side="ask", order_type="ioc")
                             exchange.insert_order(fid_far, price=book_far.asks[0].price, volume=vol, side="bid", order_type="ioc")
 
-        # ------------------------------------------------------------------
-        # 8. Constituent vs future arb: if stock-implied index diverges from future
-        # ------------------------------------------------------------------
-        if constituent_index is not None:
+        # Constituent vs future arb: only every 5th iteration (same cadence as constituent fetch)
+        if iteration % 5 == 1 and constituent_index is not None:
             fut_implied = future_price_to_index(fut_mid, tau)
             spread = constituent_index - fut_implied
 
-            # Constituent index is rich: sell ETF, buy futures
             if spread > 0.10:
                 arb_vol = 5
                 etf_book = exchange.get_last_price_book(ETF_ID)
@@ -262,12 +246,10 @@ while True:
                     sell_vol = clamp_volume(ETF_ID, "ask", arb_vol, positions)
                     if sell_vol > 0:
                         exchange.insert_order(ETF_ID, price=etf_book.bids[0].price, volume=sell_vol, side="ask", order_type="ioc")
-                        # Hedge via future
                         hedge_buy = clamp_volume(PRIMARY_FUTURE, "bid", max(1, round(ETF_M * sell_vol)), positions)
                         if hedge_buy > 0:
                             exchange.insert_order(PRIMARY_FUTURE, price=fut_ask, volume=hedge_buy, side="bid", order_type="ioc")
 
-            # Constituent index is cheap: buy ETF, sell futures
             elif spread < -0.10:
                 arb_vol = 5
                 etf_book = exchange.get_last_price_book(ETF_ID)
