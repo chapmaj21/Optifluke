@@ -38,25 +38,20 @@ OPTIONS_PER_ITER = 3
 
 
 class RateLimiter:
-    def __init__(self, rate: int = 20):
-        self._rate = rate
-        self._tokens = float(rate)
-        self._last = time.monotonic()
+    def __init__(self, rate: int = 15):
+        self._interval = 1.0 / rate
+        self._last = 0.0
 
     def acquire(self):
         now = time.monotonic()
-        self._tokens = min(self._rate, self._tokens + (now - self._last) * self._rate)
-        self._last = now
-        if self._tokens < 1.0:
-            time.sleep((1.0 - self._tokens) / self._rate)
-            self._tokens = 0.0
-            self._last = time.monotonic()
-        else:
-            self._tokens -= 1.0
+        gap = self._interval - (now - self._last)
+        if gap > 0:
+            time.sleep(gap)
+        self._last = time.monotonic()
 
 
 class Ex:
-    def __init__(self, rate: int = 20):
+    def __init__(self, rate: int = 15):
         self._inner = Exchange()
         self._inner.connect()
         self._rl = RateLimiter(rate)
@@ -188,6 +183,33 @@ def discover(e):
     return insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts
 
 
+def clear_positions(e):
+    log.info("clearing all orders and flattening positions...")
+    instruments = e.get_instruments()
+    for iid in instruments:
+        e.cancel(iid)
+
+    time.sleep(1)
+    positions = e.get_positions()
+    for iid, p in positions.items():
+        if p == 0:
+            continue
+        b = e.book(iid)
+        if not bok(b):
+            continue
+        if p > 0:
+            e.insert(iid, b.bids[0].price, abs(p), "ask", "ioc")
+        else:
+            e.insert(iid, b.asks[0].price, abs(p), "bid", "ioc")
+
+    time.sleep(1)
+    e.clear_cache()
+    positions = e.get_positions()
+    pnl = e.get_pnl()
+    remaining = {k: v for k, v in positions.items() if v != 0}
+    log.info(f"after clearing: PnL={pnl:.2f}  remaining={remaining or 'flat'}")
+
+
 def run_dual(e, duals, pos, insts):
     for liquid, dual in duals:
         lb = e.book(liquid)
@@ -205,25 +227,25 @@ def run_dual(e, duals, pos, insts):
             v = min(db.asks[0].volume, DUAL_VOLUME, pos.hr(dual, "bid"), pos.hr(liquid, "ask"))
             if v > 0:
                 e.insert(dual, dask, v, "bid", "ioc")
-                e.insert(liquid, lbid, v, "ask", "ioc")
                 pos.fill(dual, v, "bid")
+                e.insert(liquid, lbid, v, "ask", "ioc")
                 pos.fill(liquid, v, "ask")
 
         if dbid > lask:
             v = min(db.bids[0].volume, DUAL_VOLUME, pos.hr(dual, "ask"), pos.hr(liquid, "bid"))
             if v > 0:
                 e.insert(dual, dbid, v, "ask", "ioc")
-                e.insert(liquid, lask, v, "bid", "ioc")
                 pos.fill(dual, v, "ask")
+                e.insert(liquid, lask, v, "bid", "ioc")
                 pos.fill(liquid, v, "bid")
 
         dp = pos.get(dual)
         bv = min(DUAL_VOLUME, pos.hr(dual, "bid"))
         av = min(DUAL_VOLUME, pos.hr(dual, "ask"))
         if dp > 10:
-            bv = max(1, bv - dp // 2)
+            bv = max(0, bv - dp // 2)
         elif dp < -10:
-            av = max(1, av + dp // 2)
+            av = max(0, av + dp // 2)
 
         ob = td(lbid - DUAL_CREDIT, tick)
         oa = tu(lask + DUAL_CREDIT, tick)
@@ -233,7 +255,8 @@ def run_dual(e, duals, pos, insts):
             e.insert(dual, oa, av, "ask", "limit")
 
         net = pos.get(dual) + pos.get(liquid)
-        if net != 0:
+        if abs(net) > 1:
+            e.cancel(liquid)
             lb2 = e.book(liquid)
             if bok(lb2):
                 if net > 0:
@@ -280,9 +303,9 @@ def run_etf(e, primary_fut, insts, pos, const_idx):
     bv = min(ETF_VOLUME, pos.hr("OB5X_ETF", "bid"))
     av = min(ETF_VOLUME, pos.hr("OB5X_ETF", "ask"))
     if ep > 10:
-        bv = max(1, bv - ep // 2)
+        bv = max(0, bv - ep // 2)
     elif ep < -10:
-        av = max(1, av + ep // 2)
+        av = max(0, av + ep // 2)
 
     e.cancel("OB5X_ETF")
     if bv > 0:
@@ -346,15 +369,15 @@ def run_futures_arb(e, ob5x_futs, stock_futs, insts, pos):
                 v = min(5, pos.hr(far, "ask"), pos.hr(near, "bid"))
                 if v > 0:
                     e.insert(far, fb.bids[0].price, v, "ask", "ioc")
-                    e.insert(near, nb.asks[0].price, v, "bid", "ioc")
                     pos.fill(far, v, "ask")
+                    e.insert(near, nb.asks[0].price, v, "bid", "ioc")
                     pos.fill(near, v, "bid")
             elif spread < -CALENDAR_THRESHOLD:
                 v = min(5, pos.hr(far, "bid"), pos.hr(near, "ask"))
                 if v > 0:
                     e.insert(far, fb.asks[0].price, v, "bid", "ioc")
-                    e.insert(near, nb.bids[0].price, v, "ask", "ioc")
                     pos.fill(far, v, "bid")
+                    e.insert(near, nb.bids[0].price, v, "ask", "ioc")
                     pos.fill(near, v, "ask")
 
     for stock, futs in stock_futs.items():
@@ -378,15 +401,15 @@ def run_futures_arb(e, ob5x_futs, stock_futs, insts, pos):
                 v = min(5, pos.hr(fid, "ask"), pos.hr(stock, "bid"))
                 if v > 0:
                     e.insert(fid, fbook.bids[0].price, v, "ask", "ioc")
-                    e.insert(stock, sb.asks[0].price, v, "bid", "ioc")
                     pos.fill(fid, v, "ask")
+                    e.insert(stock, sb.asks[0].price, v, "bid", "ioc")
                     pos.fill(stock, v, "bid")
             elif basis < -BASIS_THRESHOLD:
                 v = min(5, pos.hr(fid, "bid"), pos.hr(stock, "ask"))
                 if v > 0:
                     e.insert(fid, fbook.asks[0].price, v, "bid", "ioc")
-                    e.insert(stock, sb.bids[0].price, v, "ask", "ioc")
                     pos.fill(fid, v, "bid")
+                    e.insert(stock, sb.bids[0].price, v, "ask", "ioc")
                     pos.fill(stock, v, "ask")
 
 
@@ -464,7 +487,7 @@ def compute_index(e) -> float | None:
     return total / INDEX_DIVISOR
 
 
-e = Ex(rate=20)
+e = Ex(rate=15)
 insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts = discover(e)
 
 all_options: list[tuple[str, object, str]] = []
@@ -478,6 +501,8 @@ primary_fut = ob5x_futs[0] if ob5x_futs else None
 const_idx: float | None = None
 opt_cursor = 0
 iteration = 0
+
+clear_positions(e)
 
 log.info(f"primary_fut={primary_fut}, {len(all_options)} options, {len(duals)} dual pairs")
 
@@ -502,7 +527,7 @@ while True:
         pos = Pos(e.get_positions())
         iteration += 1
 
-        if iteration % 3 == 1:
+        if iteration % 5 == 1:
             const_idx = compute_index(e)
 
         fut_idx = None
@@ -546,7 +571,7 @@ while True:
             active = {k: v for k, v in pos.items() if v != 0}
             log.info(f"[iter {iteration}] PnL={pnl:.2f}  {active}")
 
-        time.sleep(0.05)
+        time.sleep(0.5)
 
     except Exception as ex:
         log.error(f"error: {ex}")
