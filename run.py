@@ -16,6 +16,57 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)-8s] %(messa
 logging.getLogger("client").setLevel("ERROR")
 log = logging.getLogger("run")
 
+
+# ---- Rate limiter: wraps Exchange to enforce max 18 calls/sec ----
+
+class ThrottledExchange:
+    def __init__(self, inner: Exchange, max_per_sec: int = 18):
+        self._e = inner
+        self._interval = 1.0 / max_per_sec
+        self._last = 0.0
+
+    def _wait(self):
+        now = time.monotonic()
+        gap = self._interval - (now - self._last)
+        if gap > 0:
+            time.sleep(gap)
+        self._last = time.monotonic()
+
+    def is_connected(self):
+        return self._e.is_connected()
+
+    def connect(self):
+        return self._e.connect()
+
+    def get_instruments(self):
+        self._wait()
+        return self._e.get_instruments()
+
+    def get_positions(self):
+        self._wait()
+        return self._e.get_positions()
+
+    def get_pnl(self):
+        self._wait()
+        return self._e.get_pnl()
+
+    def get_last_price_book(self, instrument_id):
+        self._wait()
+        return self._e.get_last_price_book(instrument_id)
+
+    def insert_order(self, instrument_id, *, price, volume, side, order_type):
+        self._wait()
+        return self._e.insert_order(instrument_id, price=price, volume=volume, side=side, order_type=order_type)
+
+    def delete_orders(self, instrument_id):
+        self._wait()
+        return self._e.delete_orders(instrument_id)
+
+    def poll_new_trades(self, instrument_id):
+        self._wait()
+        return self._e.poll_new_trades(instrument_id)
+
+
 # ---- Constants ----
 
 POSITION_LIMIT = 100
@@ -252,7 +303,6 @@ def run_options_mm(e: Exchange, stock_options: dict, index_options: dict,
             e.insert_order(oid, price=bp, volume=bv, side="bid", order_type="limit")
         if av > 0 and ap > 0:
             e.insert_order(oid, price=ap, volume=av, side="ask", order_type="limit")
-        time.sleep(0.10)
 
     # Quote OB5X index options
     if index_value is not None:
@@ -419,8 +469,9 @@ def run_cross_arb(e: Exchange, instruments: dict, option_pairs: dict,
 
 # ---- Main ----
 
-e = Exchange()
-e.connect()
+_raw = Exchange()
+_raw.connect()
+e = ThrottledExchange(_raw, max_per_sec=18)
 
 instruments = e.get_instruments()
 log.info(f"connected, {len(instruments)} instruments")
@@ -467,8 +518,9 @@ while True:
     try:
         if not e.is_connected():
             log.warning("disconnected, reconnecting...")
-            e = Exchange()
-            e.connect()
+            _raw = Exchange()
+            _raw.connect()
+            e = ThrottledExchange(_raw, max_per_sec=18)
             instruments = e.get_instruments()
             time.sleep(3)
             continue
