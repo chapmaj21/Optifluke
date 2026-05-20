@@ -38,7 +38,7 @@ OPTIONS_PER_ITER = 3
 
 
 class RateLimiter:
-    def __init__(self, rate: int = 15):
+    def __init__(self, rate: int = 18):
         self._interval = 1.0 / rate
         self._last = 0.0
 
@@ -51,7 +51,7 @@ class RateLimiter:
 
 
 class Ex:
-    def __init__(self, rate: int = 15):
+    def __init__(self, rate: int = 18):
         self._inner = Exchange()
         self._inner.connect()
         self._rl = RateLimiter(rate)
@@ -433,12 +433,12 @@ def hedge_delta(e, pos, insts, stock_opts, idx_opts, ob5x_futs, stock_futs):
 
         if abs(delta) > 0.5 and bok(asml_book):
             if delta > 0.5:
-                lots = min(round(delta), pos.hr("ASML", "ask"))
+                lots = min(round(delta), pos.hr("ASML", "ask"), POSITION_LIMIT)
                 if lots > 0:
                     e.insert("ASML", asml_book.bids[0].price, lots, "ask", "ioc")
                     pos.fill("ASML", lots, "ask")
             else:
-                lots = min(round(abs(delta)), pos.hr("ASML", "bid"))
+                lots = min(round(abs(delta)), pos.hr("ASML", "bid"), POSITION_LIMIT)
                 if lots > 0:
                     e.insert("ASML", asml_book.asks[0].price, lots, "bid", "ioc")
                     pos.fill("ASML", lots, "bid")
@@ -466,12 +466,12 @@ def hedge_delta(e, pos, insts, stock_opts, idx_opts, ob5x_futs, stock_futs):
 
                 if abs(delta) > 0.5:
                     if delta > 0.5:
-                        lots = min(round(delta), pos.hr(pf, "ask"))
+                        lots = min(round(delta), pos.hr(pf, "ask"), POSITION_LIMIT)
                         if lots > 0:
                             e.insert(pf, pfb.bids[0].price, lots, "ask", "ioc")
                             pos.fill(pf, lots, "ask")
                     else:
-                        lots = min(round(abs(delta)), pos.hr(pf, "bid"))
+                        lots = min(round(abs(delta)), pos.hr(pf, "bid"), POSITION_LIMIT)
                         if lots > 0:
                             e.insert(pf, pfb.asks[0].price, lots, "bid", "ioc")
                             pos.fill(pf, lots, "bid")
@@ -501,8 +501,6 @@ primary_fut = ob5x_futs[0] if ob5x_futs else None
 const_idx: float | None = None
 opt_cursor = 0
 iteration = 0
-
-clear_positions(e)
 
 log.info(f"primary_fut={primary_fut}, {len(all_options)} options, {len(duals)} dual pairs")
 
