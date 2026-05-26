@@ -31,7 +31,7 @@ DIAG_INTERVAL = 40
 
 
 class RateLimiter:
-    def __init__(self, rate: int = 20):
+    def __init__(self, rate: int = 18):
         self._rate = rate
         self._tokens = float(rate)
         self._max = float(rate)
@@ -54,7 +54,7 @@ class Ex:
     def __init__(self):
         self._inner = Exchange()
         self._inner.connect()
-        self._rl = RateLimiter(20)
+        self._rl = RateLimiter(18)
 
     def reconnect(self):
         self._inner = Exchange()
@@ -160,19 +160,6 @@ def discover(e):
     return insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts, option_pairs, all_options, primary_fut
 
 
-def cancel_all(e, insts):
-    for iid in insts:
-        try:
-            e.cancel(iid)
-        except Exception:
-            time.sleep(1)
-            try:
-                e.cancel(iid)
-            except Exception:
-                pass
-    time.sleep(0.5)
-
-
 def compute_constituent_index(e) -> float | None:
     total = 0.0
     for sid, w in CONSTITUENTS.items():
@@ -254,6 +241,11 @@ def hedge_stock(ex, underlying: str, delta: float, pos):
 
 
 def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos):
+    # re-fetch real positions before hedging to avoid stale data
+    real_pos = ex.get_positions()
+    for k, v in real_pos.items():
+        pos._p[k] = v
+
     for underlying, opts in stock_opts.items():
         u_mid = _bmid(ex.book(underlying))
         if u_mid is None:
@@ -294,8 +286,6 @@ dual_cursor = 0
 arb_cursor = 0
 iteration = 0
 
-cancel_all(e, insts)
-
 log.info(f"primary_fut={primary_fut}, {len(all_options)} options, {len(duals)} dual pairs")
 
 while True:
@@ -307,7 +297,6 @@ while True:
             opt_cursor = 0
             dual_cursor = 0
             arb_cursor = 0
-            cancel_all(e, insts)
             time.sleep(2)
             continue
 

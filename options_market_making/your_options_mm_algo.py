@@ -9,7 +9,7 @@ from common.libs import calculate_current_time_to_date
 
 RATE = 0.03
 SIGMA = 3.0
-OPT_VOLUME = 15
+OPT_VOLUME = 3
 OPT_BASE_CREDIT = 0.05
 OPT_VEGA_SCALE = 0.02
 OPT_SPREAD_SCALE = 0.10
@@ -69,8 +69,17 @@ def quote_single_option(ex, oid: str, opt, underlying_mid: float, pos, insts: di
     ex.cancel(oid)
     bp = _td(adjusted_theo - credit, tick)
     ap = _tu(adjusted_theo + credit, tick)
+
     bv = min(OPT_VOLUME, pos.hr(oid, "bid"))
     av = min(OPT_VOLUME, pos.hr(oid, "ask"))
+    if opt_pos > 20:
+        bv = 0
+    elif opt_pos > 10:
+        bv = min(bv, 1)
+    if opt_pos < -20:
+        av = 0
+    elif opt_pos < -10:
+        av = min(av, 1)
 
     if bv > 0 and bp > 0:
         ex.insert(oid, bp, bv, "bid", "limit")
