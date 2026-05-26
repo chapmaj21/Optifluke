@@ -67,23 +67,6 @@ def run_dual_listing(ex, liquid: str, dual: str, pos, insts):
     if av > 0 and oa > 0:
         ex.insert(dual, oa, av, "ask", "limit")
 
-    net = pos.get(dual) + pos.get(liquid)
-    if abs(net) > 1:
-        lb2 = ex.book(liquid)
-        if _bv(lb2):
-            if net > 0:
-                hv = min(abs(net), pos.hr(liquid, "ask"))
-                if hv > 0:
-                    ex.cancel(liquid)
-                    ex.insert(liquid, lb2.bids[0].price, hv, "ask", "ioc")
-                    pos.fill(liquid, hv, "ask")
-            else:
-                hv = min(abs(net), pos.hr(liquid, "bid"))
-                if hv > 0:
-                    ex.cancel(liquid)
-                    ex.insert(liquid, lb2.asks[0].price, hv, "bid", "ioc")
-                    pos.fill(liquid, hv, "bid")
-
 
 def _bv(b) -> bool:
     return b and b.bids and b.asks

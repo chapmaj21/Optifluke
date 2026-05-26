@@ -148,8 +148,6 @@ def discover(e):
     for base, opts in stock_opts.items():
         for oid, inst in opts.items():
             all_options.append((oid, inst, base))
-    for oid, inst in idx_opts.items():
-        all_options.append((oid, inst, "OB5X"))
 
     primary_fut = ob5x_futs[0] if ob5x_futs else None
 
@@ -218,6 +216,26 @@ def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs,
 
     log.info("\n".join(lines))
     return pnl
+
+
+def unwind_index_options(ex, idx_opts, pos):
+    for oid in idx_opts:
+        p = pos.get(oid)
+        if p == 0:
+            continue
+        ob = ex.book(oid)
+        if not _bv(ob):
+            continue
+        if p > 0:
+            sell_vol = min(p, 5)
+            ex.cancel(oid)
+            ex.insert(oid, ob.bids[0].price, sell_vol, "ask", "ioc")
+            pos.fill(oid, sell_vol, "ask")
+        elif p < 0:
+            buy_vol = min(abs(p), 5)
+            ex.cancel(oid)
+            ex.insert(oid, ob.asks[0].price, buy_vol, "bid", "ioc")
+            pos.fill(oid, buy_vol, "bid")
 
 
 def hedge_stock(ex, underlying: str, delta: float, pos):
@@ -335,6 +353,9 @@ while True:
                 if u_mid is not None:
                     quote_single_option(e, oid, opt, u_mid, pos, insts)
             opt_cursor = (opt_cursor + OPTIONS_PER_ITER) % max(1, len(all_options))
+
+        if iteration % 3 == 0:
+            unwind_index_options(e, idx_opts, pos)
 
         if iteration % 4 == 0:
             run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, insts, pos, arb_cursor)
