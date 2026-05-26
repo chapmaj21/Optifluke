@@ -9,7 +9,7 @@ from common.libs import calculate_current_time_to_date
 
 RATE = 0.03
 SIGMA = 3.0
-OPT_VOLUME = 3
+OPT_VOLUME = 5
 OPT_BASE_CREDIT = 0.05
 OPT_VEGA_SCALE = 0.02
 OPT_SPREAD_SCALE = 0.10
