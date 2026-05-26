@@ -338,6 +338,24 @@ while True:
         if duals:
             pair = duals[dual_cursor % len(duals)]
             run_dual_listing(e, pair[0], pair[1], pos, insts)
+            liquid, dual = pair
+            if liquid not in stock_opts:
+                net = pos.get(liquid) + pos.get(dual)
+                if abs(net) > 1:
+                    lb2 = e.book(liquid)
+                    if _bv(lb2):
+                        if net > 0:
+                            hv = min(abs(net), pos.hr(liquid, "ask"))
+                            if hv > 0:
+                                e.cancel(liquid)
+                                e.insert(liquid, lb2.bids[0].price, hv, "ask", "ioc")
+                                pos.fill(liquid, hv, "ask")
+                        else:
+                            hv = min(abs(net), pos.hr(liquid, "bid"))
+                            if hv > 0:
+                                e.cancel(liquid)
+                                e.insert(liquid, lb2.asks[0].price, hv, "bid", "ioc")
+                                pos.fill(liquid, hv, "bid")
             dual_cursor += 1
 
         run_etf_quoting(e, primary_fut, insts, pos, const_idx, tau)
