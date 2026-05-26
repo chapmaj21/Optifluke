@@ -46,10 +46,21 @@ INDEX_DELTA_HARD = 75.0
 TOURNAMENT_OPTION_VOLUME = 12
 RISK_REDUCING_OPTION_VOLUME = 14
 NEAR_LIMIT_OPTION_VOLUME = 4
-INDEX_OPTION_OPEN_LIMIT = 55
-INDEX_OPTION_STRESSED_OPEN_LIMIT = 46
-STOCK_OPTION_OPEN_LIMIT = 50
-ENDGAME_OPTION_OPEN_LIMIT = 8
+INDEX_OPTION_OPEN_LIMIT = 44
+INDEX_OPTION_STRESSED_OPEN_LIMIT = 34
+INDEX_OPTION_REDUCE_TARGET = 32
+INDEX_OPTION_STRESSED_REDUCE_TARGET = 22
+STOCK_OPTION_OPEN_LIMIT = 42
+STOCK_OPTION_REDUCE_TARGET = 28
+ENDGAME_OPTION_OPEN_LIMIT = 4
+OPTION_REDUCE_IOC_VOLUME = 10
+INDEX_OPTION_TAKER_EDGE = 0.14
+STOCK_OPTION_TAKER_EDGE = 0.18
+INDEX_OPTION_TAKER_VOLUME = 5
+STOCK_OPTION_TAKER_VOLUME = 3
+INDEX_OPTION_REDUCE_SLIPPAGE = 0.55
+STRESSED_OPTION_REDUCE_SLIPPAGE = 0.90
+ENDGAME_REDUCE_SLIPPAGE = 1.60
 INDEX_HEDGE_GROSS_STRESS = 260.0
 INDEX_HEDGE_MIN_CAPACITY = 55.0
 INDEX_HEDGE_CAPACITY_BUFFER = 18.0
@@ -741,8 +752,16 @@ while True:
 
                     if base == "OB5X":
                         open_limit = INDEX_OPTION_STRESSED_OPEN_LIMIT if index_capacity_stressed else INDEX_OPTION_OPEN_LIMIT
+                        reduce_target = INDEX_OPTION_STRESSED_REDUCE_TARGET if index_capacity_stressed else INDEX_OPTION_REDUCE_TARGET
+                        reduce_slippage = STRESSED_OPTION_REDUCE_SLIPPAGE if index_capacity_stressed else INDEX_OPTION_REDUCE_SLIPPAGE
+                        taker_edge = INDEX_OPTION_TAKER_EDGE
+                        taker_volume = INDEX_OPTION_TAKER_VOLUME
                     else:
                         open_limit = STOCK_OPTION_OPEN_LIMIT
+                        reduce_target = STOCK_OPTION_REDUCE_TARGET
+                        reduce_slippage = INDEX_OPTION_REDUCE_SLIPPAGE
+                        taker_edge = STOCK_OPTION_TAKER_EDGE
+                        taker_volume = STOCK_OPTION_TAKER_VOLUME
                     inv_bid, inv_ask, reduce_only = _option_inventory_controls(opt_pos, open_limit, endgame)
                     allow_bid = allow_bid and inv_bid
                     allow_ask = allow_ask and inv_ask
@@ -766,6 +785,14 @@ while True:
                     if reduce_only or endgame:
                         credit_mult = ENDGAME_REDUCE_CREDIT_MULT if endgame else REDUCE_ONLY_CREDIT_MULT
                         quote_volume = min(max(quote_volume, RISK_REDUCING_OPTION_VOLUME), max(1, abs(opt_pos)))
+                        reduce_target = 0 if endgame else reduce_target
+                        reduce_slippage = ENDGAME_REDUCE_SLIPPAGE if endgame else reduce_slippage
+                    else:
+                        reduce_target = None
+
+                    if endgame:
+                        taker_edge = 0.0
+                        taker_volume = 0
 
                     quote_single_option(
                         e,
@@ -780,6 +807,11 @@ while True:
                         allow_ask=allow_ask,
                         volume_override=quote_volume,
                         credit_mult=credit_mult,
+                        taker_edge=taker_edge,
+                        taker_volume=taker_volume,
+                        reduce_target=reduce_target,
+                        reduce_ioc_slippage=reduce_slippage,
+                        reduce_ioc_volume=OPTION_REDUCE_IOC_VOLUME,
                     )
                     shadow_deltas[base] = _reserve_worst_option_delta(
                         shadow_deltas[base],

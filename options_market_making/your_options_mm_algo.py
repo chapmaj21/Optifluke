@@ -32,6 +32,19 @@ def _bv(b) -> bool:
     return b and b.bids and b.asks
 
 
+def _ioc(ex, iid: str, price: float, volume: int, side: str, pos) -> int:
+    if volume <= 0:
+        return 0
+    if hasattr(ex, "ioc"):
+        filled = ex.ioc(iid, price, volume, side)
+    else:
+        ex.insert(iid, price, volume, side, "ioc")
+        filled = volume
+    if filled > 0:
+        pos.fill(iid, filled, side)
+    return filled
+
+
 def _bs_value(S, K, T, kind):
     return (call_value if kind == OptionKind.CALL else put_value)(S=S, K=K, T=T, r=RATE, sigma=SIGMA)
 
@@ -76,6 +89,11 @@ def quote_single_option(
     allow_ask: bool = True,
     volume_override: int | None = None,
     credit_mult: float = 1.0,
+    taker_edge: float = 0.0,
+    taker_volume: int = 0,
+    reduce_target: int | None = None,
+    reduce_ioc_slippage: float = 0.0,
+    reduce_ioc_volume: int | None = None,
 ):
     T = calculate_current_time_to_date(opt.expiry)
     if T <= 0 or underlying_mid <= 0:
@@ -104,7 +122,30 @@ def quote_single_option(
 
     credit = _compute_credit(theo, vega, spread, underlying_spread) * credit_mult
 
+    base_volume = OPT_VOLUME if volume_override is None else volume_override
     opt_pos = pos.get(oid)
+
+    if _bv(ob) and reduce_target is not None:
+        reduce_volume = base_volume if reduce_ioc_volume is None else reduce_ioc_volume
+        if opt_pos > reduce_target and allow_ask and ob.bids[0].price >= theo - reduce_ioc_slippage:
+            v = min(opt_pos - reduce_target, reduce_volume, ob.bids[0].volume, pos.hr(oid, "ask"))
+            _ioc(ex, oid, ob.bids[0].price, v, "ask", pos)
+        elif opt_pos < -reduce_target and allow_bid and ob.asks[0].price <= theo + reduce_ioc_slippage:
+            v = min(abs(opt_pos) - reduce_target, reduce_volume, ob.asks[0].volume, pos.hr(oid, "bid"))
+            _ioc(ex, oid, ob.asks[0].price, v, "bid", pos)
+        opt_pos = pos.get(oid)
+
+    if _bv(ob) and taker_edge > 0 and taker_volume > 0 and (reduce_target is None or abs(opt_pos) <= reduce_target):
+        buy_edge = fair_bid - ob.asks[0].price
+        sell_edge = ob.bids[0].price - fair_ask
+        if allow_bid and buy_edge >= taker_edge:
+            v = min(taker_volume, ob.asks[0].volume, pos.hr(oid, "bid"))
+            _ioc(ex, oid, ob.asks[0].price, v, "bid", pos)
+        elif allow_ask and sell_edge >= taker_edge:
+            v = min(taker_volume, ob.bids[0].volume, pos.hr(oid, "ask"))
+            _ioc(ex, oid, ob.bids[0].price, v, "ask", pos)
+        opt_pos = pos.get(oid)
+
     skew = OPT_POS_SKEW * opt_pos
 
     bp = _td(fair_bid - credit - skew, tick)
@@ -113,7 +154,6 @@ def quote_single_option(
         bp = _td(theo - credit - skew, tick)
         ap = _tu(theo + credit - skew, tick)
 
-    base_volume = OPT_VOLUME if volume_override is None else volume_override
     bv = min(base_volume, pos.hr(oid, "bid"))
     av = min(base_volume, pos.hr(oid, "ask"))
     if not allow_bid:
