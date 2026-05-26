@@ -63,15 +63,19 @@ class Ex:
         return self._inner.is_connected()
 
     def get_instruments(self):
+        self._rl.acquire()
         return self._inner.get_instruments()
 
     def get_positions(self):
+        self._rl.acquire()
         return self._inner.get_positions()
 
     def get_pnl(self):
+        self._rl.acquire()
         return self._inner.get_pnl()
 
     def book(self, iid: str):
+        self._rl.acquire()
         return self._inner.get_last_price_book(iid)
 
     def insert(self, iid: str, price: float, volume: int, side: str, otype: str):
@@ -157,7 +161,14 @@ def discover(e):
 
 def cancel_all(e, insts):
     for iid in insts:
-        e.cancel(iid)
+        try:
+            e.cancel(iid)
+        except Exception:
+            time.sleep(1)
+            try:
+                e.cancel(iid)
+            except Exception:
+                pass
     time.sleep(0.5)
 
 
