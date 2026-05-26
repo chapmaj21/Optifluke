@@ -27,6 +27,7 @@ ETF_M = 0.25
 OPTIONS_PER_ITER = 2
 LOOP_SLEEP = 0.25
 DELTA_HEDGE_THRESHOLD = 0.5
+DIAG_INTERVAL = 40
 
 
 class RateLimiter:
@@ -182,6 +183,56 @@ def compute_constituent_index(e) -> float | None:
     return total / INDEX_DIVISOR
 
 
+def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, duals, prev_pnl, iteration):
+    pnl = ex.get_pnl()
+    dpnl = pnl - prev_pnl if prev_pnl is not None else 0.0
+
+    lines = [f"=== DIAG iter={iteration} PnL={pnl:.2f} (d={dpnl:+.2f}) ==="]
+
+    active = {k: v for k, v in pos.items() if v != 0}
+    if active:
+        pos_parts = [f"{k}={v:+d}" for k, v in sorted(active.items())]
+        lines.append(f"POS: {' '.join(pos_parts)}")
+    else:
+        lines.append("POS: flat")
+
+    for underlying, opts in stock_opts.items():
+        u_mid = _bmid(ex.book(underlying))
+        if u_mid is None:
+            continue
+        futs = stock_futs.get(underlying, [])
+        delta = compute_stock_delta(pos, underlying, opts, futs, u_mid)
+        if abs(delta) > 0.1:
+            lines.append(f"DELTA {underlying}: {delta:+.1f} (stock={pos.get(underlying):+d} dual={pos.get(underlying + '_DUAL'):+d} futs={sum(pos.get(f) for f in futs):+d})")
+
+    if primary_fut and ob5x_futs:
+        pfb = ex.book(primary_fut)
+        if _bv(pfb):
+            tau = calculate_current_time_to_date(insts[primary_fut].expiry)
+            if tau > 0:
+                idx_val = _bmid(pfb) / exp(RATE * tau)
+                idx_delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val)
+                etf_pos = pos.get("OB5X_ETF")
+                fut_pos = sum(pos.get(f) for f in ob5x_futs)
+                lines.append(f"DELTA OB5X: {idx_delta:+.1f} (etf={etf_pos:+d}*{ETF_M}={ETF_M*etf_pos:+.1f} futs={fut_pos:+d})")
+
+    for liquid, dual in duals:
+        lp, dp = pos.get(liquid), pos.get(dual)
+        if lp != 0 or dp != 0:
+            lines.append(f"DUAL {liquid}: liq={lp:+d} dual={dp:+d} net={lp+dp:+d}")
+
+    opt_positions = []
+    for oid in sorted(insts):
+        p = pos.get(oid)
+        if p != 0 and (insts[oid].instrument_type == InstrumentType.STOCK_OPTION or insts[oid].instrument_type == InstrumentType.INDEX_OPTION):
+            opt_positions.append(f"{oid}={p:+d}")
+    if opt_positions:
+        lines.append(f"OPTS: {' '.join(opt_positions)}")
+
+    log.info("\n".join(lines))
+    return pnl
+
+
 def hedge_stock(ex, underlying: str, delta: float, pos):
     if abs(delta) <= DELTA_HEDGE_THRESHOLD:
         return
@@ -237,6 +288,7 @@ e = Ex()
 insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts, option_pairs, all_options, primary_fut = discover(e)
 
 const_idx: float | None = None
+prev_pnl: float | None = None
 opt_cursor = 0
 dual_cursor = 0
 arb_cursor = 0
@@ -301,10 +353,8 @@ while True:
 
         hedge_all_deltas(e, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos)
 
-        if iteration % 20 == 0:
-            pnl = e.get_pnl()
-            active = {k: v for k, v in pos.items() if v != 0}
-            log.info(f"[iter {iteration}] PnL={pnl:.2f}  {active}")
+        if iteration % DIAG_INTERVAL == 0:
+            prev_pnl = run_diagnostics(e, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, duals, prev_pnl, iteration)
 
         time.sleep(LOOP_SLEEP)
 
