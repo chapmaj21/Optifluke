@@ -9,10 +9,23 @@ from common.libs import calculate_current_time_to_date
 
 RATE = 0.03
 SIGMA = 3.0
-BASIS_THRESHOLD = 0.10
-CALENDAR_THRESHOLD = 0.05
-PARITY_THRESHOLD = 0.20
+BASIS_THRESHOLD = 0.03
+CALENDAR_THRESHOLD = 0.03
+PARITY_THRESHOLD = 0.08
 ARB_VOLUME = 5
+
+
+def _ioc(ex, iid: str, price: float, volume: int, side: str, pos) -> int:
+    if volume <= 0:
+        return 0
+    if hasattr(ex, "ioc"):
+        filled = ex.ioc(iid, price, volume, side)
+    else:
+        ex.insert(iid, price, volume, side, "ioc")
+        filled = volume
+    if filled > 0:
+        pos.fill(iid, filled, side)
+    return filled
 
 
 def _bv(b) -> bool:
@@ -34,28 +47,29 @@ def run_calendar_arb(ex, ob5x_futs: list, insts: dict, pos):
             tf = calculate_current_time_to_date(insts[far].expiry)
             if tn <= 0 or tf <= 0:
                 continue
-            fair_far = _bmid(nb) * exp(RATE * (tf - tn))
-            spread = _bmid(fb) - fair_far
+            carry = exp(RATE * (tf - tn))
+            rich_edge = fb.bids[0].price - nb.asks[0].price * carry
+            cheap_edge = nb.bids[0].price * carry - fb.asks[0].price
 
-            if spread > CALENDAR_THRESHOLD:
-                v = min(ARB_VOLUME, pos.hr(far, "ask"), pos.hr(near, "bid"))
+            if rich_edge > CALENDAR_THRESHOLD:
+                v = min(ARB_VOLUME, fb.bids[0].volume, nb.asks[0].volume, pos.hr(far, "ask"), pos.hr(near, "bid"))
                 if v > 0:
                     ex.cancel(far)
-                    ex.insert(far, fb.bids[0].price, v, "ask", "ioc")
-                    pos.fill(far, v, "ask")
-                    ex.cancel(near)
-                    ex.insert(near, nb.asks[0].price, v, "bid", "ioc")
-                    pos.fill(near, v, "bid")
+                    filled = _ioc(ex, far, fb.bids[0].price, v, "ask", pos)
+                    hedge_vol = min(filled, nb.asks[0].volume, pos.hr(near, "bid"))
+                    if hedge_vol > 0:
+                        ex.cancel(near)
+                        _ioc(ex, near, nb.asks[0].price, hedge_vol, "bid", pos)
                     return
-            elif spread < -CALENDAR_THRESHOLD:
-                v = min(ARB_VOLUME, pos.hr(far, "bid"), pos.hr(near, "ask"))
+            elif cheap_edge > CALENDAR_THRESHOLD:
+                v = min(ARB_VOLUME, fb.asks[0].volume, nb.bids[0].volume, pos.hr(far, "bid"), pos.hr(near, "ask"))
                 if v > 0:
                     ex.cancel(far)
-                    ex.insert(far, fb.asks[0].price, v, "bid", "ioc")
-                    pos.fill(far, v, "bid")
-                    ex.cancel(near)
-                    ex.insert(near, nb.bids[0].price, v, "ask", "ioc")
-                    pos.fill(near, v, "ask")
+                    filled = _ioc(ex, far, fb.asks[0].price, v, "bid", pos)
+                    hedge_vol = min(filled, nb.bids[0].volume, pos.hr(near, "ask"))
+                    if hedge_vol > 0:
+                        ex.cancel(near)
+                        _ioc(ex, near, nb.bids[0].price, hedge_vol, "ask", pos)
                     return
 
 
@@ -64,7 +78,6 @@ def run_basis_arb(ex, stock_futs: dict, insts: dict, pos):
         sb = ex.book(stock)
         if not _bv(sb):
             continue
-        s_mid = _bmid(sb)
         for fid in futs:
             if fid not in insts:
                 continue
@@ -74,28 +87,29 @@ def run_basis_arb(ex, stock_futs: dict, insts: dict, pos):
             tau = calculate_current_time_to_date(insts[fid].expiry)
             if tau <= 0:
                 continue
-            fair = s_mid * exp(RATE * tau)
-            basis = _bmid(fbook) - fair
+            carry = exp(RATE * tau)
+            rich_edge = fbook.bids[0].price - sb.asks[0].price * carry
+            cheap_edge = sb.bids[0].price * carry - fbook.asks[0].price
 
-            if basis > BASIS_THRESHOLD:
-                v = min(ARB_VOLUME, pos.hr(fid, "ask"), pos.hr(stock, "bid"))
+            if rich_edge > BASIS_THRESHOLD:
+                v = min(ARB_VOLUME, fbook.bids[0].volume, sb.asks[0].volume, pos.hr(fid, "ask"), pos.hr(stock, "bid"))
                 if v > 0:
                     ex.cancel(fid)
-                    ex.insert(fid, fbook.bids[0].price, v, "ask", "ioc")
-                    pos.fill(fid, v, "ask")
-                    ex.cancel(stock)
-                    ex.insert(stock, sb.asks[0].price, v, "bid", "ioc")
-                    pos.fill(stock, v, "bid")
+                    filled = _ioc(ex, fid, fbook.bids[0].price, v, "ask", pos)
+                    hedge_vol = min(filled, sb.asks[0].volume, pos.hr(stock, "bid"))
+                    if hedge_vol > 0:
+                        ex.cancel(stock)
+                        _ioc(ex, stock, sb.asks[0].price, hedge_vol, "bid", pos)
                     return
-            elif basis < -BASIS_THRESHOLD:
-                v = min(ARB_VOLUME, pos.hr(fid, "bid"), pos.hr(stock, "ask"))
+            elif cheap_edge > BASIS_THRESHOLD:
+                v = min(ARB_VOLUME, fbook.asks[0].volume, sb.bids[0].volume, pos.hr(fid, "bid"), pos.hr(stock, "ask"))
                 if v > 0:
                     ex.cancel(fid)
-                    ex.insert(fid, fbook.asks[0].price, v, "bid", "ioc")
-                    pos.fill(fid, v, "bid")
-                    ex.cancel(stock)
-                    ex.insert(stock, sb.bids[0].price, v, "ask", "ioc")
-                    pos.fill(stock, v, "ask")
+                    filled = _ioc(ex, fid, fbook.asks[0].price, v, "bid", pos)
+                    hedge_vol = min(filled, sb.bids[0].volume, pos.hr(stock, "ask"))
+                    if hedge_vol > 0:
+                        ex.cancel(stock)
+                        _ioc(ex, stock, sb.bids[0].price, hedge_vol, "ask", pos)
                     return
 
 
@@ -118,49 +132,62 @@ def run_parity_arb(ex, option_pairs: dict, insts: dict, pos):
         if tau <= 0:
             continue
 
-        s_mid = _bmid(sb)
         pv_strike = strike * exp(-RATE * tau)
-        theo_diff = s_mid - pv_strike
+        rich_edge = (cb.bids[0].price - pb.asks[0].price) - (sb.asks[0].price - pv_strike)
+        cheap_edge = (sb.bids[0].price - pv_strike) - (cb.asks[0].price - pb.bids[0].price)
 
-        market_diff = _bmid(cb) - _bmid(pb)
-        mispricing = market_diff - theo_diff
+        s_mid = _bmid(sb)
 
-        if mispricing > PARITY_THRESHOLD:
-            v = min(ARB_VOLUME, pos.hr(call_id, "ask"), pos.hr(put_id, "bid"))
+        if rich_edge > PARITY_THRESHOLD:
+            v = min(
+                ARB_VOLUME,
+                cb.bids[0].volume,
+                pb.asks[0].volume,
+                sb.asks[0].volume,
+                pos.hr(call_id, "ask"),
+                pos.hr(put_id, "bid"),
+                pos.hr(underlying, "bid"),
+            )
             if v > 0:
                 ex.cancel(call_id)
-                ex.insert(call_id, cb.bids[0].price, v, "ask", "ioc")
-                pos.fill(call_id, v, "ask")
+                filled_call = _ioc(ex, call_id, cb.bids[0].price, v, "ask", pos)
+                if filled_call <= 0:
+                    return
                 ex.cancel(put_id)
-                ex.insert(put_id, pb.asks[0].price, v, "bid", "ioc")
-                pos.fill(put_id, v, "bid")
+                filled_put = _ioc(ex, put_id, pb.asks[0].price, min(filled_call, pb.asks[0].volume, pos.hr(put_id, "bid")), "bid", pos)
                 d_call = call_delta(s_mid, strike, tau, RATE, SIGMA)
                 d_put = put_delta(s_mid, strike, tau, RATE, SIGMA)
-                hedge_lots = round(v * (d_call + d_put))
-                if hedge_lots > 0:
-                    hv = min(hedge_lots, pos.hr(underlying, "bid"))
-                    if hv > 0:
-                        ex.insert(underlying, sb.asks[0].price, hv, "bid", "ioc")
-                        pos.fill(underlying, hv, "bid")
+                net_delta = -filled_call * d_call + filled_put * d_put
+                hedge_lots = round(abs(net_delta))
+                hv = min(hedge_lots, sb.asks[0].volume, pos.hr(underlying, "bid"))
+                if hv > 0:
+                    _ioc(ex, underlying, sb.asks[0].price, hv, "bid", pos)
                 return
 
-        elif mispricing < -PARITY_THRESHOLD:
-            v = min(ARB_VOLUME, pos.hr(call_id, "bid"), pos.hr(put_id, "ask"))
+        elif cheap_edge > PARITY_THRESHOLD:
+            v = min(
+                ARB_VOLUME,
+                cb.asks[0].volume,
+                pb.bids[0].volume,
+                sb.bids[0].volume,
+                pos.hr(call_id, "bid"),
+                pos.hr(put_id, "ask"),
+                pos.hr(underlying, "ask"),
+            )
             if v > 0:
                 ex.cancel(call_id)
-                ex.insert(call_id, cb.asks[0].price, v, "bid", "ioc")
-                pos.fill(call_id, v, "bid")
+                filled_call = _ioc(ex, call_id, cb.asks[0].price, v, "bid", pos)
+                if filled_call <= 0:
+                    return
                 ex.cancel(put_id)
-                ex.insert(put_id, pb.bids[0].price, v, "ask", "ioc")
-                pos.fill(put_id, v, "ask")
+                filled_put = _ioc(ex, put_id, pb.bids[0].price, min(filled_call, pb.bids[0].volume, pos.hr(put_id, "ask")), "ask", pos)
                 d_call = call_delta(s_mid, strike, tau, RATE, SIGMA)
                 d_put = put_delta(s_mid, strike, tau, RATE, SIGMA)
-                hedge_lots = round(v * abs(d_call + d_put))
-                if hedge_lots > 0:
-                    hv = min(hedge_lots, pos.hr(underlying, "ask"))
-                    if hv > 0:
-                        ex.insert(underlying, sb.bids[0].price, hv, "ask", "ioc")
-                        pos.fill(underlying, hv, "ask")
+                net_delta = filled_call * d_call - filled_put * d_put
+                hedge_lots = round(abs(net_delta))
+                hv = min(hedge_lots, sb.bids[0].volume, pos.hr(underlying, "ask"))
+                if hv > 0:
+                    _ioc(ex, underlying, sb.bids[0].price, hv, "ask", pos)
                 return
 
 

@@ -7,6 +7,19 @@ POS_SKEW_THRESHOLD = 10
 POS_SKEW_DIVISOR = 3
 
 
+def _ioc(ex, iid: str, price: float, volume: int, side: str, pos) -> int:
+    if volume <= 0:
+        return 0
+    if hasattr(ex, "ioc"):
+        filled = ex.ioc(iid, price, volume, side)
+    else:
+        ex.insert(iid, price, volume, side, "ioc")
+        filled = volume
+    if filled > 0:
+        pos.fill(iid, filled, side)
+    return filled
+
+
 def _td(price: float, tick: float) -> float:
     return floor(price / tick) * tick
 
@@ -16,6 +29,8 @@ def _tu(price: float, tick: float) -> float:
 
 
 def run_dual_listing(ex, liquid: str, dual: str, pos, insts):
+    ex.cancel(dual)
+
     lb = ex.book(liquid)
     db = ex.book(dual)
     if not (_bv(lb) and _bv(db)):
@@ -25,32 +40,25 @@ def run_dual_listing(ex, liquid: str, dual: str, pos, insts):
     lbid, lask = lb.bids[0].price, lb.asks[0].price
     dbid, dask = db.bids[0].price, db.asks[0].price
 
-    arbed = False
-
     if dask < lbid:
-        v = min(db.asks[0].volume, DUAL_VOLUME, pos.hr(dual, "bid"), pos.hr(liquid, "ask"))
+        v = min(db.asks[0].volume, lb.bids[0].volume, DUAL_VOLUME, pos.hr(dual, "bid"), pos.hr(liquid, "ask"))
         if v > 0:
-            ex.cancel(dual)
-            ex.insert(dual, dask, v, "bid", "ioc")
-            pos.fill(dual, v, "bid")
-            ex.cancel(liquid)
-            ex.insert(liquid, lbid, v, "ask", "ioc")
-            pos.fill(liquid, v, "ask")
-            arbed = True
+            filled = _ioc(ex, dual, dask, v, "bid", pos)
+            if filled > 0:
+                hedge_vol = min(filled, lb.bids[0].volume, pos.hr(liquid, "ask"))
+                if hedge_vol > 0:
+                    ex.cancel(liquid)
+                    _ioc(ex, liquid, lbid, hedge_vol, "ask", pos)
 
     elif dbid > lask:
-        v = min(db.bids[0].volume, DUAL_VOLUME, pos.hr(dual, "ask"), pos.hr(liquid, "bid"))
+        v = min(db.bids[0].volume, lb.asks[0].volume, DUAL_VOLUME, pos.hr(dual, "ask"), pos.hr(liquid, "bid"))
         if v > 0:
-            ex.cancel(dual)
-            ex.insert(dual, dbid, v, "ask", "ioc")
-            pos.fill(dual, v, "ask")
-            ex.cancel(liquid)
-            ex.insert(liquid, lask, v, "bid", "ioc")
-            pos.fill(liquid, v, "bid")
-            arbed = True
-
-    if not arbed:
-        ex.cancel(dual)
+            filled = _ioc(ex, dual, dbid, v, "ask", pos)
+            if filled > 0:
+                hedge_vol = min(filled, lb.asks[0].volume, pos.hr(liquid, "bid"))
+                if hedge_vol > 0:
+                    ex.cancel(liquid)
+                    _ioc(ex, liquid, lask, hedge_vol, "bid", pos)
 
     dp = pos.get(dual)
     bv = min(DUAL_VOLUME, pos.hr(dual, "bid"))

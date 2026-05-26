@@ -24,7 +24,7 @@ SIGMA = 3.0
 CONSTITUENTS = {"ASML": 908.06, "AAPL": 129.24, "SAP": 124.78, "TSLA": 2245.39, "NVDA": 953.21}
 INDEX_DIVISOR = 1000.0
 ETF_M = 0.25
-OPTIONS_PER_ITER = 2
+OPTIONS_PER_ITER = 6
 LOOP_SLEEP = 0.25
 DELTA_HEDGE_THRESHOLD = 0.5
 DIAG_INTERVAL = 40
@@ -81,7 +81,36 @@ class Ex:
 
     def insert(self, iid: str, price: float, volume: int, side: str, otype: str):
         self._rl.acquire()
-        return self._inner.insert_order(iid, price=price, volume=volume, side=side, order_type=otype)
+        resp = self._inner.insert_order(iid, price=price, volume=volume, side=side, order_type=otype)
+        if not getattr(resp, "success", False):
+            log.warning(f"insert failed {iid} {side} {volume}@{price:.2f} {otype}: {getattr(resp, 'error_reason', None)}")
+        return resp
+
+    def poll_trades(self, iid: str):
+        self._rl.acquire()
+        return self._inner.poll_new_trades(iid)
+
+    def ioc(self, iid: str, price: float, volume: int, side: str) -> int:
+        if volume <= 0:
+            return 0
+
+        resp = self.insert(iid, price, volume, side, "ioc")
+        if not getattr(resp, "success", False):
+            return 0
+
+        order_id = getattr(resp, "order_id", None)
+        if order_id is None:
+            return 0
+
+        filled = 0
+        # IOC fills should be available immediately, but one short retry avoids
+        # treating a delayed trade callback as a miss.
+        for attempt in range(2):
+            trades = self.poll_trades(iid)
+            filled += sum(t.volume for t in trades if getattr(t, "order_id", None) == order_id)
+            if attempt == 0:
+                time.sleep(0.02)
+        return filled
 
     def cancel(self, iid: str):
         self._rl.acquire()
@@ -104,6 +133,9 @@ class Pos:
             self._p[iid] = self.get(iid) + vol
         else:
             self._p[iid] = self.get(iid) - vol
+
+    def replace(self, raw: dict):
+        self._p = dict(raw)
 
     def items(self):
         return self._p.items()
@@ -149,11 +181,16 @@ def discover(e):
         for oid, inst in opts.items():
             all_options.append((oid, inst, base))
 
+    for oid, inst in idx_opts.items():
+        all_options.append((oid, inst, "OB5X"))
+
+    all_options.sort(key=lambda x: (x[2], x[1].expiry, x[1].strike, str(x[1].option_kind), x[0]))
+
     primary_fut = ob5x_futs[0] if ob5x_futs else None
 
     log.info(f"{len(insts)} instruments: {len(duals)} dual pairs, {len(ob5x_futs)} OB5X futs, "
              f"stock_futs={list(stock_futs.keys())}, stock_opts={list(stock_opts.keys())}, "
-             f"{len(idx_opts)} idx opts, {len(all_options)} total options")
+             f"{len(idx_opts)} idx opts, {len(all_options)} quoted options")
 
     return insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts, option_pairs, all_options, primary_fut
 
@@ -186,7 +223,7 @@ def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs,
         if u_mid is None:
             continue
         futs = stock_futs.get(underlying, [])
-        delta = compute_stock_delta(pos, underlying, opts, futs, u_mid)
+        delta = compute_stock_delta(pos, underlying, opts, futs, u_mid, insts)
         if abs(delta) > 0.1:
             lines.append(f"DELTA {underlying}: {delta:+.1f} (stock={pos.get(underlying):+d} dual={pos.get(underlying + '_DUAL'):+d} futs={sum(pos.get(f) for f in futs):+d})")
 
@@ -196,7 +233,7 @@ def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs,
             tau = calculate_current_time_to_date(insts[primary_fut].expiry)
             if tau > 0:
                 idx_val = _bmid(pfb) / exp(RATE * tau)
-                idx_delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val)
+                idx_delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val, insts)
                 etf_pos = pos.get("OB5X_ETF")
                 fut_pos = sum(pos.get(f) for f in ob5x_futs)
                 lines.append(f"DELTA OB5X: {idx_delta:+.1f} (etf={etf_pos:+d}*{ETF_M}={ETF_M*etf_pos:+.1f} futs={fut_pos:+d})")
@@ -229,13 +266,13 @@ def unwind_index_options(ex, idx_opts, pos):
         if p > 0:
             sell_vol = min(p, 5)
             ex.cancel(oid)
-            ex.insert(oid, ob.bids[0].price, sell_vol, "ask", "ioc")
-            pos.fill(oid, sell_vol, "ask")
+            filled = ex.ioc(oid, ob.bids[0].price, sell_vol, "ask")
+            pos.fill(oid, filled, "ask")
         elif p < 0:
             buy_vol = min(abs(p), 5)
             ex.cancel(oid)
-            ex.insert(oid, ob.asks[0].price, buy_vol, "bid", "ioc")
-            pos.fill(oid, buy_vol, "bid")
+            filled = ex.ioc(oid, ob.asks[0].price, buy_vol, "bid")
+            pos.fill(oid, filled, "bid")
 
 
 def hedge_stock(ex, underlying: str, delta: float, pos):
@@ -248,28 +285,26 @@ def hedge_stock(ex, underlying: str, delta: float, pos):
         lots = min(round(delta), pos.hr(underlying, "ask"), POSITION_LIMIT)
         if lots > 0:
             ex.cancel(underlying)
-            ex.insert(underlying, b.bids[0].price, lots, "ask", "ioc")
-            pos.fill(underlying, lots, "ask")
+            filled = ex.ioc(underlying, b.bids[0].price, lots, "ask")
+            pos.fill(underlying, filled, "ask")
     else:
         lots = min(round(abs(delta)), pos.hr(underlying, "bid"), POSITION_LIMIT)
         if lots > 0:
             ex.cancel(underlying)
-            ex.insert(underlying, b.asks[0].price, lots, "bid", "ioc")
-            pos.fill(underlying, lots, "bid")
+            filled = ex.ioc(underlying, b.asks[0].price, lots, "bid")
+            pos.fill(underlying, filled, "bid")
 
 
 def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos):
     # re-fetch real positions before hedging to avoid stale data
-    real_pos = ex.get_positions()
-    for k, v in real_pos.items():
-        pos._p[k] = v
+    pos.replace(ex.get_positions())
 
     for underlying, opts in stock_opts.items():
         u_mid = _bmid(ex.book(underlying))
         if u_mid is None:
             continue
         futs = stock_futs.get(underlying, [])
-        delta = compute_stock_delta(pos, underlying, opts, futs, u_mid)
+        delta = compute_stock_delta(pos, underlying, opts, futs, u_mid, insts)
         hedge_stock(ex, underlying, delta, pos)
 
     if primary_fut and ob5x_futs:
@@ -278,20 +313,21 @@ def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, pri
             tau = calculate_current_time_to_date(insts[primary_fut].expiry)
             if tau > 0:
                 idx_val = _bmid(pfb) / exp(RATE * tau)
-                delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val)
+                delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val, insts)
                 if abs(delta) > DELTA_HEDGE_THRESHOLD:
+                    hedge_unit = exp(RATE * tau)
                     if delta > DELTA_HEDGE_THRESHOLD:
-                        lots = min(round(delta), pos.hr(primary_fut, "ask"), POSITION_LIMIT)
+                        lots = min(round(delta / hedge_unit), pos.hr(primary_fut, "ask"), POSITION_LIMIT)
                         if lots > 0:
                             ex.cancel(primary_fut)
-                            ex.insert(primary_fut, pfb.bids[0].price, lots, "ask", "ioc")
-                            pos.fill(primary_fut, lots, "ask")
+                            filled = ex.ioc(primary_fut, pfb.bids[0].price, lots, "ask")
+                            pos.fill(primary_fut, filled, "ask")
                     else:
-                        lots = min(round(abs(delta)), pos.hr(primary_fut, "bid"), POSITION_LIMIT)
+                        lots = min(round(abs(delta) / hedge_unit), pos.hr(primary_fut, "bid"), POSITION_LIMIT)
                         if lots > 0:
                             ex.cancel(primary_fut)
-                            ex.insert(primary_fut, pfb.asks[0].price, lots, "bid", "ioc")
-                            pos.fill(primary_fut, lots, "bid")
+                            filled = ex.ioc(primary_fut, pfb.asks[0].price, lots, "bid")
+                            pos.fill(primary_fut, filled, "bid")
 
 
 e = Ex()
@@ -334,6 +370,15 @@ while True:
                     fut_idx = _bmid(pfb) / exp(RATE * tau)
 
         pricing_idx = fut_idx or const_idx
+        pricing_idx_bid = None
+        pricing_idx_ask = None
+        if primary_fut and _bv(pfb) and tau > 0:
+            disc = exp(RATE * tau)
+            pricing_idx_bid = pfb.bids[0].price / disc
+            pricing_idx_ask = pfb.asks[0].price / disc
+        if const_idx is not None:
+            pricing_idx_bid = const_idx if pricing_idx_bid is None else min(pricing_idx_bid, const_idx)
+            pricing_idx_ask = const_idx if pricing_idx_ask is None else max(pricing_idx_ask, const_idx)
 
         if duals:
             pair = duals[dual_cursor % len(duals)]
@@ -343,19 +388,27 @@ while True:
         run_etf_quoting(e, primary_fut, insts, pos, const_idx, tau)
 
         if all_options:
+            underlying_quotes: dict[str, tuple[float, float, float]] = {}
             for i in range(OPTIONS_PER_ITER):
                 idx = (opt_cursor + i) % len(all_options)
                 oid, opt, base = all_options[idx]
                 if base == "OB5X":
-                    u_mid = pricing_idx
+                    if pricing_idx is not None:
+                        underlying_quotes[base] = (
+                            pricing_idx_bid if pricing_idx_bid is not None else pricing_idx,
+                            pricing_idx_ask if pricing_idx_ask is not None else pricing_idx,
+                            pricing_idx,
+                        )
                 else:
-                    u_mid = _bmid(e.book(base)) if base in insts else None
-                if u_mid is not None:
-                    quote_single_option(e, oid, opt, u_mid, pos, insts)
+                    if base not in underlying_quotes and base in insts:
+                        ub = e.book(base)
+                        if _bv(ub):
+                            underlying_quotes[base] = (ub.bids[0].price, ub.asks[0].price, _bmid(ub))
+                quote = underlying_quotes.get(base)
+                if quote is not None:
+                    u_bid, u_ask, u_mid = quote
+                    quote_single_option(e, oid, opt, u_mid, pos, insts, u_bid, u_ask)
             opt_cursor = (opt_cursor + OPTIONS_PER_ITER) % max(1, len(all_options))
-
-        if iteration % 3 == 0:
-            unwind_index_options(e, idx_opts, pos)
 
         if iteration % 4 == 0:
             run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, insts, pos, arb_cursor)
