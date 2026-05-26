@@ -41,13 +41,14 @@ INDEX_DELTA_HARD = 75.0
 TOURNAMENT_OPTION_VOLUME = 12
 RISK_REDUCING_OPTION_VOLUME = 14
 NEAR_LIMIT_OPTION_VOLUME = 4
+API_RATE_LIMIT = 20
 
 
 class RateLimiter:
-    def __init__(self, rate: int = 18):
+    def __init__(self, rate: int = API_RATE_LIMIT):
         self._rate = rate
-        self._tokens = float(rate)
-        self._max = float(rate)
+        self._tokens = 0.0
+        self._max = 1.0
         self._last = time.monotonic()
 
     def acquire(self, n: int = 1):
@@ -67,7 +68,7 @@ class Ex:
     def __init__(self):
         self._inner = Exchange()
         self._inner.connect()
-        self._rl = RateLimiter(18)
+        self._rl = RateLimiter()
 
     def reconnect(self):
         self._inner = Exchange()
@@ -127,7 +128,13 @@ class Ex:
 
     def cancel(self, iid: str):
         self._rl.acquire()
-        self._inner.delete_orders(iid)
+        try:
+            self._inner.delete_orders(iid)
+            return True
+        except Exception as err:
+            log.warning(f"cancel failed {iid}: {err}")
+            time.sleep(1.0)
+            return False
 
 
 class Pos:
@@ -221,6 +228,8 @@ def compute_constituent_index(e) -> float | None:
 
 def cancel_all_orders(ex, insts):
     for iid in sorted(insts):
+        if not ex.is_connected():
+            return
         ex.cancel(iid)
 
 
