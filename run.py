@@ -28,6 +28,10 @@ OPTIONS_PER_ITER = 6
 LOOP_SLEEP = 0.25
 DELTA_HEDGE_THRESHOLD = 0.5
 DIAG_INTERVAL = 40
+QUOTE_INDEX_OPTIONS = False
+INDEX_OPTION_UNWIND_PER_ITER = 2
+INDEX_OPTION_UNWIND_LOT = 8
+DUAL_NET_HEDGE_THRESHOLD = 2
 
 
 class RateLimiter:
@@ -181,8 +185,9 @@ def discover(e):
         for oid, inst in opts.items():
             all_options.append((oid, inst, base))
 
-    for oid, inst in idx_opts.items():
-        all_options.append((oid, inst, "OB5X"))
+    if QUOTE_INDEX_OPTIONS:
+        for oid, inst in idx_opts.items():
+            all_options.append((oid, inst, "OB5X"))
 
     all_options.sort(key=lambda x: (x[2], x[1].expiry, x[1].strike, str(x[1].option_kind), x[0]))
 
@@ -255,8 +260,13 @@ def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs,
     return pnl
 
 
-def unwind_index_options(ex, idx_opts, pos):
-    for oid in idx_opts:
+def unwind_index_options(ex, idx_opts, pos, cursor: int, max_options: int = INDEX_OPTION_UNWIND_PER_ITER) -> int:
+    ids = sorted(idx_opts)
+    if not ids:
+        return cursor
+
+    for i in range(min(max_options, len(ids))):
+        oid = ids[(cursor + i) % len(ids)]
         p = pos.get(oid)
         if p == 0:
             continue
@@ -264,15 +274,44 @@ def unwind_index_options(ex, idx_opts, pos):
         if not _bv(ob):
             continue
         if p > 0:
-            sell_vol = min(p, 5)
+            sell_vol = min(p, INDEX_OPTION_UNWIND_LOT)
             ex.cancel(oid)
             filled = ex.ioc(oid, ob.bids[0].price, sell_vol, "ask")
             pos.fill(oid, filled, "ask")
         elif p < 0:
-            buy_vol = min(abs(p), 5)
+            buy_vol = min(abs(p), INDEX_OPTION_UNWIND_LOT)
             ex.cancel(oid)
             filled = ex.ioc(oid, ob.asks[0].price, buy_vol, "bid")
             pos.fill(oid, filled, "bid")
+
+    return (cursor + max_options) % len(ids)
+
+
+def hedge_unhandled_dual_nets(ex, duals, stock_opts, stock_futs, pos):
+    for liquid, dual in duals:
+        if liquid in stock_opts or stock_futs.get(liquid):
+            continue
+
+        net = pos.get(liquid) + pos.get(dual)
+        if abs(net) <= DUAL_NET_HEDGE_THRESHOLD:
+            continue
+
+        book = ex.book(liquid)
+        if not _bv(book):
+            continue
+
+        if net > 0:
+            vol = min(abs(net), book.bids[0].volume, pos.hr(liquid, "ask"))
+            if vol > 0:
+                ex.cancel(liquid)
+                filled = ex.ioc(liquid, book.bids[0].price, vol, "ask")
+                pos.fill(liquid, filled, "ask")
+        else:
+            vol = min(abs(net), book.asks[0].volume, pos.hr(liquid, "bid"))
+            if vol > 0:
+                ex.cancel(liquid)
+                filled = ex.ioc(liquid, book.asks[0].price, vol, "bid")
+                pos.fill(liquid, filled, "bid")
 
 
 def hedge_stock(ex, underlying: str, delta: float, pos):
@@ -338,6 +377,7 @@ prev_pnl: float | None = None
 opt_cursor = 0
 dual_cursor = 0
 arb_cursor = 0
+idx_unwind_cursor = 0
 iteration = 0
 
 log.info(f"primary_fut={primary_fut}, {len(all_options)} options, {len(duals)} dual pairs")
@@ -351,6 +391,7 @@ while True:
             opt_cursor = 0
             dual_cursor = 0
             arb_cursor = 0
+            idx_unwind_cursor = 0
             time.sleep(2)
             continue
 
@@ -410,11 +451,14 @@ while True:
                     quote_single_option(e, oid, opt, u_mid, pos, insts, u_bid, u_ask)
             opt_cursor = (opt_cursor + OPTIONS_PER_ITER) % max(1, len(all_options))
 
+        idx_unwind_cursor = unwind_index_options(e, idx_opts, pos, idx_unwind_cursor)
+
         if iteration % 4 == 0:
             run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, insts, pos, arb_cursor)
             arb_cursor += 1
 
         hedge_all_deltas(e, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos)
+        hedge_unhandled_dual_nets(e, duals, stock_opts, stock_futs, pos)
 
         if iteration % DIAG_INTERVAL == 0:
             prev_pnl = run_diagnostics(e, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, duals, prev_pnl, iteration)
