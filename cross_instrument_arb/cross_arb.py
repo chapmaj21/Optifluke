@@ -165,10 +165,8 @@ def run_parity_arb(ex, option_pairs: dict, insts: dict, pos):
 
 
 def run_cross_arb(ex, ob5x_futs, stock_futs, option_pairs, insts, pos, sub_cursor: int):
-    phase = sub_cursor % 3
+    phase = sub_cursor % 2
     if phase == 0:
-        run_calendar_arb(ex, ob5x_futs, insts, pos)
-    elif phase == 1:
         run_basis_arb(ex, stock_futs, insts, pos)
     else:
         run_parity_arb(ex, option_pairs, insts, pos)

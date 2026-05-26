@@ -274,26 +274,35 @@ def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, pri
         delta = compute_stock_delta(pos, underlying, opts, futs, u_mid)
         hedge_stock(ex, underlying, delta, pos)
 
-    if primary_fut and ob5x_futs:
-        pfb = ex.book(primary_fut)
-        if _bv(pfb):
-            tau = calculate_current_time_to_date(insts[primary_fut].expiry)
+    if ob5x_futs:
+        ref_book = ex.book(ob5x_futs[0])
+        if _bv(ref_book):
+            tau = calculate_current_time_to_date(insts[ob5x_futs[0]].expiry)
             if tau > 0:
-                idx_val = _bmid(pfb) / exp(RATE * tau)
+                idx_val = _bmid(ref_book) / exp(RATE * tau)
                 delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val)
-                if abs(delta) > DELTA_HEDGE_THRESHOLD:
-                    if delta > DELTA_HEDGE_THRESHOLD:
-                        lots = min(round(delta), pos.hr(primary_fut, "ask"), POSITION_LIMIT)
-                        if lots > 0:
-                            ex.cancel(primary_fut)
-                            ex.insert(primary_fut, pfb.bids[0].price, lots, "ask", "ioc")
-                            pos.fill(primary_fut, lots, "ask")
-                    else:
-                        lots = min(round(abs(delta)), pos.hr(primary_fut, "bid"), POSITION_LIMIT)
-                        if lots > 0:
-                            ex.cancel(primary_fut)
-                            ex.insert(primary_fut, pfb.asks[0].price, lots, "bid", "ioc")
-                            pos.fill(primary_fut, lots, "bid")
+                remaining = delta
+                if abs(remaining) > DELTA_HEDGE_THRESHOLD:
+                    for fid in ob5x_futs:
+                        if abs(remaining) <= DELTA_HEDGE_THRESHOLD:
+                            break
+                        fb = ex.book(fid)
+                        if not _bv(fb):
+                            continue
+                        if remaining > DELTA_HEDGE_THRESHOLD:
+                            lots = min(round(remaining), pos.hr(fid, "ask"), POSITION_LIMIT)
+                            if lots > 0:
+                                ex.cancel(fid)
+                                ex.insert(fid, fb.bids[0].price, lots, "ask", "ioc")
+                                pos.fill(fid, lots, "ask")
+                                remaining -= lots
+                        elif remaining < -DELTA_HEDGE_THRESHOLD:
+                            lots = min(round(abs(remaining)), pos.hr(fid, "bid"), POSITION_LIMIT)
+                            if lots > 0:
+                                ex.cancel(fid)
+                                ex.insert(fid, fb.asks[0].price, lots, "bid", "ioc")
+                                pos.fill(fid, lots, "bid")
+                                remaining += lots
 
 
 e = Ex()
