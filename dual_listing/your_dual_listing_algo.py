@@ -1,8 +1,8 @@
 from math import floor, ceil
 
 
-DUAL_CREDIT = 0.02
-DUAL_VOLUME = 15
+DUAL_CREDIT = 0.01
+DUAL_VOLUME = 20
 POS_SKEW_THRESHOLD = 10
 POS_SKEW_DIVISOR = 3
 

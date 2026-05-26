@@ -9,7 +9,7 @@ from common.libs import calculate_current_time_to_date
 
 RATE = 0.03
 SIGMA = 3.0
-OPT_VOLUME = 8
+OPT_VOLUME = 10
 OPT_BASE_CREDIT = 0.03
 OPT_VEGA_SCALE = 0.006
 OPT_SPREAD_SCALE = 0.05
@@ -44,6 +44,13 @@ def _bs_vega(S, K, T, kind):
     return (call_vega if kind == OptionKind.CALL else put_vega)(S=S, K=K, T=T, r=RATE, sigma=SIGMA)
 
 
+def option_delta(opt, underlying_mid: float) -> float:
+    T = calculate_current_time_to_date(opt.expiry)
+    if T <= 0 or underlying_mid <= 0:
+        return 0.0
+    return _bs_delta(underlying_mid, opt.strike, T, opt.option_kind)
+
+
 def _compute_credit(theo: float, vega: float, option_spread: float, underlying_spread: float) -> float:
     c = (
         OPT_BASE_CREDIT
@@ -65,6 +72,10 @@ def quote_single_option(
     insts: dict,
     underlying_bid: float | None = None,
     underlying_ask: float | None = None,
+    allow_bid: bool = True,
+    allow_ask: bool = True,
+    volume_override: int | None = None,
+    credit_mult: float = 1.0,
 ):
     T = calculate_current_time_to_date(opt.expiry)
     if T <= 0 or underlying_mid <= 0:
@@ -91,7 +102,7 @@ def quote_single_option(
     spread = (ob.asks[0].price - ob.bids[0].price) if _bv(ob) else 0.0
     underlying_spread = max(0.0, underlying_ask - underlying_bid)
 
-    credit = _compute_credit(theo, vega, spread, underlying_spread)
+    credit = _compute_credit(theo, vega, spread, underlying_spread) * credit_mult
 
     opt_pos = pos.get(oid)
     skew = OPT_POS_SKEW * opt_pos
@@ -102,8 +113,13 @@ def quote_single_option(
         bp = _td(theo - credit - skew, tick)
         ap = _tu(theo + credit - skew, tick)
 
-    bv = min(OPT_VOLUME, pos.hr(oid, "bid"))
-    av = min(OPT_VOLUME, pos.hr(oid, "ask"))
+    base_volume = OPT_VOLUME if volume_override is None else volume_override
+    bv = min(base_volume, pos.hr(oid, "bid"))
+    av = min(base_volume, pos.hr(oid, "ask"))
+    if not allow_bid:
+        bv = 0
+    if not allow_ask:
+        av = 0
     if opt_pos > 50:
         bv = 0
         av = min(av + 4, pos.hr(oid, "ask"))
@@ -116,6 +132,10 @@ def quote_single_option(
     elif opt_pos < -25:
         av = min(av, 1)
         bv = min(bv + 2, pos.hr(oid, "bid"))
+    if not allow_bid:
+        bv = 0
+    if not allow_ask:
+        av = 0
 
     if bv > 0 and bp > 0:
         ex.insert(oid, bp, bv, "bid", "limit")

@@ -9,10 +9,10 @@ from common.libs import calculate_current_time_to_date
 
 RATE = 0.03
 SIGMA = 3.0
-BASIS_THRESHOLD = 0.03
-CALENDAR_THRESHOLD = 0.03
-PARITY_THRESHOLD = 0.08
-ARB_VOLUME = 5
+BASIS_THRESHOLD = 0.02
+CALENDAR_THRESHOLD = 0.02
+PARITY_THRESHOLD = 0.06
+ARB_VOLUME = 8
 
 
 def _ioc(ex, iid: str, price: float, volume: int, side: str, pos) -> int:

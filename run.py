@@ -11,7 +11,7 @@ from common.libs import calculate_current_time_to_date
 
 from dual_listing.your_dual_listing_algo import run_dual_listing
 from etf_future.your_etf_future_algo import run_etf_quoting
-from options_market_making.your_options_mm_algo import quote_single_option, compute_stock_delta, compute_index_delta
+from options_market_making.your_options_mm_algo import quote_single_option, compute_stock_delta, compute_index_delta, option_delta
 from cross_instrument_arb.cross_arb import run_cross_arb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)-8s] %(message)s", datefmt="%H:%M:%S")
@@ -24,14 +24,23 @@ SIGMA = 3.0
 CONSTITUENTS = {"ASML": 908.06, "AAPL": 129.24, "SAP": 124.78, "TSLA": 2245.39, "NVDA": 953.21}
 INDEX_DIVISOR = 1000.0
 ETF_M = 0.25
-OPTIONS_PER_ITER = 6
+OPTIONS_PER_ITER = 4
 LOOP_SLEEP = 0.25
 DELTA_HEDGE_THRESHOLD = 0.5
-DIAG_INTERVAL = 40
-QUOTE_INDEX_OPTIONS = False
-INDEX_OPTION_UNWIND_PER_ITER = 2
+DIAG_INTERVAL = 20
+QUOTE_INDEX_OPTIONS = True
+UNWIND_INDEX_OPTIONS = False
+INDEX_OPTION_UNWIND_PER_ITER = 1
 INDEX_OPTION_UNWIND_LOT = 8
 DUAL_NET_HEDGE_THRESHOLD = 2
+TOURNAMENT_OPTION_CREDIT_MULT = 0.82
+ASML_DELTA_SOFT = 70.0
+ASML_DELTA_HARD = 88.0
+INDEX_DELTA_SOFT = 55.0
+INDEX_DELTA_HARD = 75.0
+TOURNAMENT_OPTION_VOLUME = 12
+RISK_REDUCING_OPTION_VOLUME = 14
+NEAR_LIMIT_OPTION_VOLUME = 4
 
 
 class RateLimiter:
@@ -210,6 +219,54 @@ def compute_constituent_index(e) -> float | None:
     return total / INDEX_DIVISOR
 
 
+def cancel_all_orders(ex, insts):
+    for iid in sorted(insts):
+        ex.cancel(iid)
+
+
+def _future_delta_unit(insts, fid: str) -> float:
+    tau = calculate_current_time_to_date(insts[fid].expiry)
+    return exp(RATE * tau) if tau > 0 else 1.0
+
+
+def _option_quote_controls(base_delta: float, opt_delta: float, soft_limit: float, hard_limit: float):
+    volume = TOURNAMENT_OPTION_VOLUME
+    if abs(base_delta) > soft_limit:
+        volume = NEAR_LIMIT_OPTION_VOLUME
+
+    allow_bid = abs(base_delta + opt_delta * volume) <= hard_limit
+    allow_ask = abs(base_delta - opt_delta * volume) <= hard_limit
+
+    if base_delta > soft_limit:
+        # Positive portfolio delta: only keep sides that can reduce it.
+        if opt_delta > 0:
+            allow_bid = False
+        elif opt_delta < 0:
+            allow_ask = False
+    elif base_delta < -soft_limit:
+        # Negative portfolio delta: only keep sides that can reduce it.
+        if opt_delta > 0:
+            allow_ask = False
+        elif opt_delta < 0:
+            allow_bid = False
+
+    if (base_delta > soft_limit and ((opt_delta > 0 and allow_ask) or (opt_delta < 0 and allow_bid))) or (
+        base_delta < -soft_limit and ((opt_delta > 0 and allow_bid) or (opt_delta < 0 and allow_ask))
+    ):
+        volume = RISK_REDUCING_OPTION_VOLUME
+
+    return allow_bid, allow_ask, volume
+
+
+def _reserve_worst_option_delta(shadow_delta: float, opt_delta: float, allow_bid: bool, allow_ask: bool, volume: int) -> float:
+    candidates = [shadow_delta]
+    if allow_bid:
+        candidates.append(shadow_delta + opt_delta * volume)
+    if allow_ask:
+        candidates.append(shadow_delta - opt_delta * volume)
+    return max(candidates, key=lambda x: abs(x))
+
+
 def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, duals, prev_pnl, iteration):
     pnl = ex.get_pnl()
     dpnl = pnl - prev_pnl if prev_pnl is not None else 0.0
@@ -334,6 +391,81 @@ def hedge_stock(ex, underlying: str, delta: float, pos):
             pos.fill(underlying, filled, "bid")
 
 
+def hedge_stock_complex(ex, underlying: str, delta: float, stock_futs: list[str], insts: dict, pos):
+    remaining = delta
+    if abs(remaining) <= DELTA_HEDGE_THRESHOLD:
+        return
+
+    hedge_instruments: list[tuple[str, float]] = [(underlying, 1.0)]
+    for fid in stock_futs:
+        if fid in insts:
+            hedge_instruments.append((fid, _future_delta_unit(insts, fid)))
+
+    for iid, unit in hedge_instruments:
+        if abs(remaining) <= DELTA_HEDGE_THRESHOLD:
+            return
+
+        book = ex.book(iid)
+        if not _bv(book):
+            continue
+
+        if remaining > 0:
+            lots = min(round(abs(remaining) / unit), book.bids[0].volume, pos.hr(iid, "ask"), POSITION_LIMIT)
+            if lots <= 0:
+                continue
+            ex.cancel(iid)
+            filled = ex.ioc(iid, book.bids[0].price, lots, "ask")
+            pos.fill(iid, filled, "ask")
+            remaining -= filled * unit
+        else:
+            lots = min(round(abs(remaining) / unit), book.asks[0].volume, pos.hr(iid, "bid"), POSITION_LIMIT)
+            if lots <= 0:
+                continue
+            ex.cancel(iid)
+            filled = ex.ioc(iid, book.asks[0].price, lots, "bid")
+            pos.fill(iid, filled, "bid")
+            remaining += filled * unit
+
+
+def hedge_index_complex(ex, insts, ob5x_futs, primary_fut, delta: float, pos):
+    remaining = delta
+    if abs(remaining) <= DELTA_HEDGE_THRESHOLD:
+        return
+
+    hedge_ids = []
+    if primary_fut:
+        hedge_ids.append(primary_fut)
+    hedge_ids.extend(fid for fid in ob5x_futs if fid != primary_fut)
+
+    for fid in hedge_ids:
+        if abs(remaining) <= DELTA_HEDGE_THRESHOLD:
+            return
+        if fid not in insts:
+            continue
+
+        book = ex.book(fid)
+        if not _bv(book):
+            continue
+
+        unit = _future_delta_unit(insts, fid)
+        if remaining > 0:
+            lots = min(round(abs(remaining) / unit), book.bids[0].volume, pos.hr(fid, "ask"), POSITION_LIMIT)
+            if lots <= 0:
+                continue
+            ex.cancel(fid)
+            filled = ex.ioc(fid, book.bids[0].price, lots, "ask")
+            pos.fill(fid, filled, "ask")
+            remaining -= filled * unit
+        else:
+            lots = min(round(abs(remaining) / unit), book.asks[0].volume, pos.hr(fid, "bid"), POSITION_LIMIT)
+            if lots <= 0:
+                continue
+            ex.cancel(fid)
+            filled = ex.ioc(fid, book.asks[0].price, lots, "bid")
+            pos.fill(fid, filled, "bid")
+            remaining += filled * unit
+
+
 def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos):
     # re-fetch real positions before hedging to avoid stale data
     pos.replace(ex.get_positions())
@@ -344,7 +476,7 @@ def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, pri
             continue
         futs = stock_futs.get(underlying, [])
         delta = compute_stock_delta(pos, underlying, opts, futs, u_mid, insts)
-        hedge_stock(ex, underlying, delta, pos)
+        hedge_stock_complex(ex, underlying, delta, futs, insts, pos)
 
     if primary_fut and ob5x_futs:
         pfb = ex.book(primary_fut)
@@ -354,23 +486,12 @@ def hedge_all_deltas(ex, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, pri
                 idx_val = _bmid(pfb) / exp(RATE * tau)
                 delta = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, idx_val, insts)
                 if abs(delta) > DELTA_HEDGE_THRESHOLD:
-                    hedge_unit = exp(RATE * tau)
-                    if delta > DELTA_HEDGE_THRESHOLD:
-                        lots = min(round(delta / hedge_unit), pos.hr(primary_fut, "ask"), POSITION_LIMIT)
-                        if lots > 0:
-                            ex.cancel(primary_fut)
-                            filled = ex.ioc(primary_fut, pfb.bids[0].price, lots, "ask")
-                            pos.fill(primary_fut, filled, "ask")
-                    else:
-                        lots = min(round(abs(delta) / hedge_unit), pos.hr(primary_fut, "bid"), POSITION_LIMIT)
-                        if lots > 0:
-                            ex.cancel(primary_fut)
-                            filled = ex.ioc(primary_fut, pfb.asks[0].price, lots, "bid")
-                            pos.fill(primary_fut, filled, "bid")
+                    hedge_index_complex(ex, insts, ob5x_futs, primary_fut, delta, pos)
 
 
 e = Ex()
 insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts, option_pairs, all_options, primary_fut = discover(e)
+cancel_all_orders(e, insts)
 
 const_idx: float | None = None
 prev_pnl: float | None = None
@@ -388,6 +509,7 @@ while True:
             log.warning("disconnected, reconnecting...")
             e.reconnect()
             insts, duals, ob5x_futs, stock_futs, stock_opts, idx_opts, option_pairs, all_options, primary_fut = discover(e)
+            cancel_all_orders(e, insts)
             opt_cursor = 0
             dual_cursor = 0
             arb_cursor = 0
@@ -430,6 +552,7 @@ while True:
 
         if all_options:
             underlying_quotes: dict[str, tuple[float, float, float]] = {}
+            shadow_deltas: dict[str, float] = {}
             for i in range(OPTIONS_PER_ITER):
                 idx = (opt_cursor + i) % len(all_options)
                 oid, opt, base = all_options[idx]
@@ -448,10 +571,49 @@ while True:
                 quote = underlying_quotes.get(base)
                 if quote is not None:
                     u_bid, u_ask, u_mid = quote
-                    quote_single_option(e, oid, opt, u_mid, pos, insts, u_bid, u_ask)
+                    if base not in shadow_deltas:
+                        if base == "OB5X":
+                            shadow_deltas[base] = compute_index_delta(pos, idx_opts, ob5x_futs, ETF_M, u_mid, insts)
+                        else:
+                            shadow_deltas[base] = compute_stock_delta(
+                                pos,
+                                base,
+                                stock_opts.get(base, {}),
+                                stock_futs.get(base, []),
+                                u_mid,
+                                insts,
+                            )
+
+                    soft = INDEX_DELTA_SOFT if base == "OB5X" else ASML_DELTA_SOFT
+                    hard = INDEX_DELTA_HARD if base == "OB5X" else ASML_DELTA_HARD
+                    opt_d = option_delta(opt, u_mid)
+                    allow_bid, allow_ask, quote_volume = _option_quote_controls(shadow_deltas[base], opt_d, soft, hard)
+
+                    quote_single_option(
+                        e,
+                        oid,
+                        opt,
+                        u_mid,
+                        pos,
+                        insts,
+                        u_bid,
+                        u_ask,
+                        allow_bid=allow_bid,
+                        allow_ask=allow_ask,
+                        volume_override=quote_volume,
+                        credit_mult=TOURNAMENT_OPTION_CREDIT_MULT,
+                    )
+                    shadow_deltas[base] = _reserve_worst_option_delta(
+                        shadow_deltas[base],
+                        opt_d,
+                        allow_bid,
+                        allow_ask,
+                        quote_volume,
+                    )
             opt_cursor = (opt_cursor + OPTIONS_PER_ITER) % max(1, len(all_options))
 
-        idx_unwind_cursor = unwind_index_options(e, idx_opts, pos, idx_unwind_cursor)
+        if UNWIND_INDEX_OPTIONS:
+            idx_unwind_cursor = unwind_index_options(e, idx_opts, pos, idx_unwind_cursor)
 
         if iteration % 4 == 0:
             run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, insts, pos, arb_cursor)
