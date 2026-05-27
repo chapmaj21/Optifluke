@@ -12,6 +12,8 @@ SIGMA = 3.0
 BASIS_THRESHOLD = 0.02
 CALENDAR_THRESHOLD = 0.02
 PARITY_THRESHOLD = 0.06
+INDEX_PARITY_THRESHOLD = 0.05
+INDEX_PARITY_VOLUME = 8
 ARB_VOLUME = 8
 
 
@@ -191,11 +193,124 @@ def run_parity_arb(ex, option_pairs: dict, insts: dict, pos):
                 return
 
 
-def run_cross_arb(ex, ob5x_futs, stock_futs, option_pairs, insts, pos, sub_cursor: int):
-    phase = sub_cursor % 3
+def _matched_index_future(ob5x_futs: list, expiry, insts: dict) -> str | None:
+    for fid in ob5x_futs:
+        if fid in insts and insts[fid].expiry == expiry:
+            return fid
+    return ob5x_futs[0] if ob5x_futs else None
+
+
+def run_index_parity_arb(ex, idx_opts: dict, ob5x_futs: list, insts: dict, pos):
+    option_pairs: dict = {}
+    for oid, opt in idx_opts.items():
+        key = (opt.expiry, opt.strike)
+        option_pairs.setdefault(key, {})[opt.option_kind] = oid
+
+    for (expiry, strike), kinds in option_pairs.items():
+        if OptionKind.CALL not in kinds or OptionKind.PUT not in kinds:
+            continue
+
+        fid = _matched_index_future(ob5x_futs, expiry, insts)
+        if not fid:
+            continue
+
+        call_id = kinds[OptionKind.CALL]
+        put_id = kinds[OptionKind.PUT]
+        cb = ex.book(call_id)
+        pb = ex.book(put_id)
+        fb = ex.book(fid)
+
+        if not (_bv(cb) and _bv(pb) and _bv(fb)):
+            continue
+
+        tau = calculate_current_time_to_date(expiry)
+        if tau <= 0:
+            continue
+
+        df = exp(-RATE * tau)
+        carry = exp(RATE * tau)
+        fbid, fask = fb.bids[0].price, fb.asks[0].price
+        idx_mid = _bmid(fb) * df
+
+        rich_edge = (cb.bids[0].price - pb.asks[0].price) - (fask - strike) * df
+        cheap_edge = (fbid - strike) * df - (cb.asks[0].price - pb.bids[0].price)
+
+        if rich_edge > INDEX_PARITY_THRESHOLD:
+            v = min(
+                INDEX_PARITY_VOLUME,
+                cb.bids[0].volume,
+                pb.asks[0].volume,
+                pos.hr(call_id, "ask"),
+                pos.hr(put_id, "bid"),
+            )
+            if v <= 0:
+                continue
+
+            ex.cancel(call_id)
+            filled_call = _ioc(ex, call_id, cb.bids[0].price, v, "ask", pos)
+            if filled_call <= 0:
+                return
+            ex.cancel(put_id)
+            filled_put = _ioc(ex, put_id, pb.asks[0].price, min(filled_call, pb.asks[0].volume, pos.hr(put_id, "bid")), "bid", pos)
+
+            d_call = call_delta(idx_mid, strike, tau, RATE, SIGMA)
+            d_put = put_delta(idx_mid, strike, tau, RATE, SIGMA)
+            net_delta = -filled_call * d_call + filled_put * d_put
+            hedge_lots = round(abs(net_delta) / carry)
+            if net_delta < -0.5:
+                hv = min(hedge_lots, fb.asks[0].volume, pos.hr(fid, "bid"))
+                if hv > 0:
+                    ex.cancel(fid)
+                    _ioc(ex, fid, fask, hv, "bid", pos)
+            elif net_delta > 0.5:
+                hv = min(hedge_lots, fb.bids[0].volume, pos.hr(fid, "ask"))
+                if hv > 0:
+                    ex.cancel(fid)
+                    _ioc(ex, fid, fbid, hv, "ask", pos)
+            return
+
+        if cheap_edge > INDEX_PARITY_THRESHOLD:
+            v = min(
+                INDEX_PARITY_VOLUME,
+                cb.asks[0].volume,
+                pb.bids[0].volume,
+                pos.hr(call_id, "bid"),
+                pos.hr(put_id, "ask"),
+            )
+            if v <= 0:
+                continue
+
+            ex.cancel(call_id)
+            filled_call = _ioc(ex, call_id, cb.asks[0].price, v, "bid", pos)
+            if filled_call <= 0:
+                return
+            ex.cancel(put_id)
+            filled_put = _ioc(ex, put_id, pb.bids[0].price, min(filled_call, pb.bids[0].volume, pos.hr(put_id, "ask")), "ask", pos)
+
+            d_call = call_delta(idx_mid, strike, tau, RATE, SIGMA)
+            d_put = put_delta(idx_mid, strike, tau, RATE, SIGMA)
+            net_delta = filled_call * d_call - filled_put * d_put
+            hedge_lots = round(abs(net_delta) / carry)
+            if net_delta > 0.5:
+                hv = min(hedge_lots, fb.bids[0].volume, pos.hr(fid, "ask"))
+                if hv > 0:
+                    ex.cancel(fid)
+                    _ioc(ex, fid, fbid, hv, "ask", pos)
+            elif net_delta < -0.5:
+                hv = min(hedge_lots, fb.asks[0].volume, pos.hr(fid, "bid"))
+                if hv > 0:
+                    ex.cancel(fid)
+                    _ioc(ex, fid, fask, hv, "bid", pos)
+            return
+
+
+def run_cross_arb(ex, ob5x_futs, stock_futs, option_pairs, idx_opts, insts, pos, sub_cursor: int):
+    phase = sub_cursor % 4
     if phase == 0:
-        run_calendar_arb(ex, ob5x_futs, insts, pos)
+        run_index_parity_arb(ex, idx_opts, ob5x_futs, insts, pos)
     elif phase == 1:
+        run_calendar_arb(ex, ob5x_futs, insts, pos)
+    elif phase == 2:
         run_basis_arb(ex, stock_futs, insts, pos)
     else:
         run_parity_arb(ex, option_pairs, insts, pos)

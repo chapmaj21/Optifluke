@@ -826,7 +826,7 @@ while True:
             idx_unwind_cursor = unwind_index_options(e, idx_opts, pos, idx_unwind_cursor)
 
         if iteration % 4 == 0 and not hedge_only:
-            run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, insts, pos, arb_cursor)
+            run_cross_arb(e, ob5x_futs, stock_futs, option_pairs, idx_opts, insts, pos, arb_cursor)
             arb_cursor += 1
 
         hedge_all_deltas(e, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, pos)
