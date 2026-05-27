@@ -1,6 +1,6 @@
 import time
 import logging
-from math import exp, floor, ceil
+from math import exp
 
 from optibook.synchronous_client import Exchange
 from optibook.common_types import InstrumentType, OptionKind
@@ -25,7 +25,6 @@ CONSTITUENTS = {"ASML": 908.06, "AAPL": 129.24, "SAP": 124.78, "TSLA": 2245.39, 
 INDEX_DIVISOR = 1000.0
 ETF_M = 0.25
 OPTIONS_PER_ITER = 4
-FUTURES_PER_ITER = 2
 LOOP_SLEEP = 0.25
 DELTA_HEDGE_THRESHOLD = 0.5
 DIAG_INTERVAL = 20
@@ -65,12 +64,6 @@ ENDGAME_REDUCE_SLIPPAGE = 1.60
 INDEX_HEDGE_GROSS_STRESS = 260.0
 INDEX_HEDGE_MIN_CAPACITY = 55.0
 INDEX_HEDGE_CAPACITY_BUFFER = 18.0
-FUTURE_QUOTE_VOLUME = 16
-FUTURE_TAKER_VOLUME = 12
-FUTURE_CREDIT = 0.015
-FUTURE_TAKER_EDGE = 0.04
-FUTURE_POS_SKEW = 0.012
-FUTURE_SOFT_POS = 70
 API_RATE_LIMIT = 20
 
 
@@ -199,14 +192,6 @@ def _bmid(b) -> float | None:
     return (b.bids[0].price + b.asks[0].price) / 2.0 if _bv(b) else None
 
 
-def _td(price: float, tick: float) -> float:
-    return floor(price / tick) * tick
-
-
-def _tu(price: float, tick: float) -> float:
-    return ceil(price / tick) * tick
-
-
 def discover(e):
     insts = e.get_instruments()
     duals = [(iid, iid + "_DUAL") for iid in sorted(insts) if iid + "_DUAL" in insts]
@@ -271,12 +256,9 @@ def cancel_all_orders(ex, insts):
         ex.cancel(iid)
 
 
-def cancel_passive_tournament_orders(ex, duals, stock_futs, ob5x_futs, insts):
+def cancel_passive_tournament_orders(ex, duals, insts):
     ids = ["OB5X_ETF"]
     ids.extend(dual for _, dual in duals)
-    for futs in stock_futs.values():
-        ids.extend(futs)
-    ids.extend(ob5x_futs)
     for iid in ids:
         if iid not in insts:
             continue
@@ -400,116 +382,6 @@ def _reserve_worst_option_delta(shadow_delta: float, opt_delta: float, allow_bid
     if allow_ask:
         candidates.append(shadow_delta - opt_delta * volume)
     return max(candidates, key=lambda x: abs(x))
-
-
-def _future_quote_ids(stock_futs: dict[str, list[str]], ob5x_futs: list[str]) -> list[tuple[str, str]]:
-    ids: list[tuple[str, str]] = []
-    for base, futs in sorted(stock_futs.items()):
-        for fid in futs:
-            ids.append((fid, base))
-    for fid in ob5x_futs:
-        ids.append((fid, "OB5X"))
-    ids.sort(key=lambda item: item[0])
-    return ids
-
-
-def _quote_future(
-    ex,
-    fid: str,
-    fair_bid: float,
-    fair_ask: float,
-    pos,
-    insts,
-    volume: int = FUTURE_QUOTE_VOLUME,
-    taker_edge: float = FUTURE_TAKER_EDGE,
-):
-    if fid not in insts or fair_bid <= 0 or fair_ask <= 0:
-        return
-
-    ex.cancel(fid)
-    book = ex.book(fid)
-    if not _bv(book):
-        return
-
-    fbid, fask = book.bids[0].price, book.asks[0].price
-    if fair_bid - fask >= taker_edge:
-        v = min(FUTURE_TAKER_VOLUME, book.asks[0].volume, pos.hr(fid, "bid"))
-        filled = ex.ioc(fid, fask, v, "bid")
-        pos.fill(fid, filled, "bid")
-    elif fbid - fair_ask >= taker_edge:
-        v = min(FUTURE_TAKER_VOLUME, book.bids[0].volume, pos.hr(fid, "ask"))
-        filled = ex.ioc(fid, fbid, v, "ask")
-        pos.fill(fid, filled, "ask")
-
-    tick = insts[fid].tick_size
-    fut_pos = pos.get(fid)
-    skew = FUTURE_POS_SKEW * fut_pos
-    bp = _td(fair_bid - FUTURE_CREDIT - skew, tick)
-    ap = _tu(fair_ask + FUTURE_CREDIT - skew, tick)
-    if bp <= 0 or ap <= 0 or bp >= ap:
-        return
-
-    bv = min(volume, pos.hr(fid, "bid"))
-    av = min(volume, pos.hr(fid, "ask"))
-    if fut_pos > FUTURE_SOFT_POS:
-        bv = min(bv, 2)
-        av = min(av + 6, pos.hr(fid, "ask"))
-    elif fut_pos < -FUTURE_SOFT_POS:
-        av = min(av, 2)
-        bv = min(bv + 6, pos.hr(fid, "bid"))
-
-    if bv > 0:
-        ex.insert(fid, bp, bv, "bid", "limit")
-    if av > 0:
-        ex.insert(fid, ap, av, "ask", "limit")
-
-
-def run_future_fair_value_quotes(
-    ex,
-    insts,
-    stock_futs,
-    ob5x_futs,
-    const_idx: float | None,
-    pos,
-    cursor: int,
-    max_futures: int = FUTURES_PER_ITER,
-) -> int:
-    quote_ids = _future_quote_ids(stock_futs, ob5x_futs)
-    if not quote_ids:
-        return cursor
-
-    spot_cache: dict[str, tuple[float, float]] = {}
-    quoted = 0
-    for i in range(len(quote_ids)):
-        if quoted >= max_futures:
-            break
-        fid, base = quote_ids[(cursor + i) % len(quote_ids)]
-        if fid not in insts:
-            continue
-        tau = calculate_current_time_to_date(insts[fid].expiry)
-        if tau <= 0:
-            continue
-        carry = exp(RATE * tau)
-
-        if base == "OB5X":
-            if const_idx is None:
-                continue
-            fair_bid = const_idx * carry
-            fair_ask = fair_bid
-        else:
-            if base not in spot_cache:
-                book = ex.book(base)
-                if not _bv(book):
-                    continue
-                spot_cache[base] = (book.bids[0].price, book.asks[0].price)
-            sbid, sask = spot_cache[base]
-            fair_bid = sbid * carry
-            fair_ask = sask * carry
-
-        _quote_future(ex, fid, fair_bid, fair_ask, pos, insts)
-        quoted += 1
-
-    return (cursor + max(1, quoted)) % len(quote_ids)
 
 
 def run_diagnostics(ex, pos, insts, stock_opts, stock_futs, idx_opts, ob5x_futs, primary_fut, duals, prev_pnl, iteration):
@@ -766,7 +638,6 @@ opt_cursor = 0
 dual_cursor = 0
 arb_cursor = 0
 idx_unwind_cursor = 0
-future_cursor = 0
 iteration = 0
 tournament_start = time.monotonic()
 endgame_logged = False
@@ -785,7 +656,6 @@ while True:
             dual_cursor = 0
             arb_cursor = 0
             idx_unwind_cursor = 0
-            future_cursor = 0
             time.sleep(2)
             continue
 
@@ -798,7 +668,7 @@ while True:
             endgame_logged = True
         if hedge_only and not hedge_only_logged:
             log.info(f"entering final hedge-only mode at t={elapsed:.0f}s, seconds_left={seconds_left:.0f}")
-            cancel_passive_tournament_orders(e, duals, stock_futs, ob5x_futs, insts)
+            cancel_passive_tournament_orders(e, duals, insts)
             hedge_only_logged = True
 
         if iteration % 5 == 1:
@@ -831,17 +701,6 @@ while True:
 
         if not hedge_only:
             run_etf_quoting(e, primary_fut, insts, pos, const_idx, tau)
-
-        if not hedge_only:
-            future_cursor = run_future_fair_value_quotes(
-                e,
-                insts,
-                stock_futs,
-                ob5x_futs,
-                const_idx,
-                pos,
-                future_cursor,
-            )
 
         if all_options:
             underlying_quotes: dict[str, tuple[float, float, float]] = {}
